@@ -1,0 +1,23 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "fencevision",
+  "main": "src/worker.js",
+  "compatibility_date": "2024-01-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "./dist"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "fencevision-production",
+      "database_id": "99a88507-677d-4e30-a2c3-bf39a7bfe4ef"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "VIDEOS",
+      "bucket_name": "fencevision-videos"
+    }
+  ]
+}

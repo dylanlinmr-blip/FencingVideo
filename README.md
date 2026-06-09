@@ -2,76 +2,69 @@
 
 ## Project Overview
 - **Name**: FenceVision
-- **Goal**: Analyze fencing bouts with synchronized video playback, right-of-way support, tip trajectory marking, and persistent scoring history.
-- **Stack**: React + Vite + TailwindCSS (frontend), Express + SQLite + multer (backend)
+- **Goal**: Analyze fencing bouts with frame-accurate review, ROW support, tip trails, and persistent touch tracking.
+- **Stack**: React + Vite + TailwindCSS frontend, Cloudflare Worker (Hono), Cloudflare D1 + R2.
+
+## Production URL
+- **Live App**: https://6f63fe90-8afc-40c2-82a8-6227bfa0d828.vip.gensparksite.com
 
 ## Completed Features
-- Upload MP4/WEBM/MOV bouts with metadata (title, weapon, fencer names)
-- Persistent SQLite storage for bouts, touches, tip marks, and running score
-- Analyzer with frame/time stepping, speed control (0.1x–2x), timeline scrubber, frame counter
-- Weapon-aware logic: Foil/Sabre ROW assistant + Épée touch mode with optional double-touch toggle
-- Tip trail marking on canvas overlay (left=red, right=green), fade-time control, clear-by-fencer
-- Touch logging with scorer, timestamp, weapon context, verdict, optional notes, undo last touch
-- Bout library with cards, embedded video preview, score, weapon badge, created date, open/delete
-- Empty-state UI for clean first use
+- Video upload for `.mp4/.webm/.mov` through `/api/bouts`
+- Video playback + frame/time stepping controls, speed, scrubber, frame/time display
+- Weapon selector per bout (foil/sabre/epee)
+- ROW assistant logic for foil/sabre and simplified epee handling
+- Tip trail mark mode with fading red/green overlays
+- Persistent touch scoreboard/log with undo
+- Bout library (open/delete, score/date/weapon shown)
+- Cloudflare-native persistence:
+  - **D1**: bouts, touches, tip_marks
+  - **R2**: uploaded video objects
 
-## Functional Routes (UI)
-- `/` → Bout library page
-- `/upload` → Upload page
-- `/analyzer/:id` → Main analysis workspace
-- `/about` → Product summary
+## UI Routes
+- `/` → Bouts library
+- `/upload` → Upload bout
+- `/analyzer/:id` → Main analysis view
+- `/about` → Product info
 
-## API Endpoints
-- `POST /api/bouts` (multipart: video + metadata)
+## API Routes
+- `GET /api/health`
+- `POST /api/bouts` (multipart: `video`, `title`, `weapon`, `left_name`, `right_name`)
 - `GET /api/bouts`
 - `GET /api/bouts/:id`
 - `DELETE /api/bouts/:id`
 - `POST /api/bouts/:id/touches`
 - `DELETE /api/touches/:id`
-- `POST /api/bouts/:id/tip-marks` (batch)
+- `POST /api/bouts/:id/tip-marks`
 - `DELETE /api/bouts/:id/tip-marks?fencer=left|right`
 - `GET /uploads/:filename`
 
-## Data Architecture
-### SQLite tables
+## Data Model
 - `bouts(id, title, weapon, left_name, right_name, video_filename, created_at, left_score, right_score)`
 - `touches(id, bout_id, video_time_seconds, scorer, row_verdict, note, created_at)`
 - `tip_marks(id, bout_id, fencer, video_time_seconds, x_norm, y_norm, created_at)`
 
-### Storage
-- SQLite file: `data/fencevision.db`
-- Video files: `uploads/`
-
-## Setup
+## Local Development
 ```bash
 cd /home/user/webapp
 npm install
+npm run build
 npm run dev
 ```
-- Frontend: `http://localhost:3000`
-- Backend: `http://localhost:3001`
-
-## User Guide
-1. Go to **Upload** and upload a bout video with metadata.
-2. Open the bout from **Bouts**.
-3. Use transport controls under the video to inspect frame-by-frame.
-4. In **ROW Assistant**, set decisions and press **Record Touch**.
-5. In **Tip Trail**, enable **Mark Tip mode** and click tip positions over time.
-6. In **Touches**, review score/log or undo the last touch.
+`npm run dev` runs `wrangler pages dev` with local D1/R2 bindings.
 
 ## Not Yet Implemented
-- Automatic video thumbnail extraction to still image files
-- Multi-user auth and role permissions
-- Export/import of full bout analysis packages
-- Advanced machine vision auto-tip detection
+- Automatic thumbnail extraction from uploaded video first frame
+- Export/import package (JSON/CSV)
+- Multi-user auth/permissions
+- Automated CV-based tip detection
 
 ## Recommended Next Steps
-1. Add true step wizard Back/Next UI for ROW with persistent per-touch draft state.
-2. Add per-bout notes persistence in database.
-3. Add CSV/JSON export for touches + tip marks.
-4. Add unit tests for ROW decision logic and API validation.
+1. Add true step-by-step ROW wizard UI (Back/Next state machine).
+2. Add input validation + toast error states for all API failures.
+3. Add export for touches/tip marks and per-bout notes persistence.
+4. Add test suite for ROW logic and Worker endpoints.
 
 ## Deployment Status
-- **Platform**: Local full-stack dev runtime (Vite + Express)
-- **Status**: ✅ Running in sandbox
+- **Platform**: Genspark-hosted Cloudflare Worker + D1 + R2
+- **Status**: ✅ Active
 - **Last Updated**: 2026-06-09

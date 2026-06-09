@@ -6,9 +6,6 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',
     port: 3000,
-    proxy: {
-      '/api': 'http://localhost:3001',
-      '/uploads': 'http://localhost:3001',
-    },
+    allowedHosts: ['3000-i42psi2g0v0kqiownnxas-dfc00ec5.sandbox.novita.ai'],
   },
 })
