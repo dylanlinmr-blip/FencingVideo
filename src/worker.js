@@ -98,8 +98,13 @@ app.post('/api/bouts', async (c) => {
     return c.json({ error: 'Missing required fields' }, 400)
   }
 
-  const allowed = new Set(['video/mp4', 'video/webm', 'video/quicktime'])
-  if (!allowed.has(file.type)) return c.json({ error: 'Invalid file type' }, 400)
+  const allowedMime = new Set(['video/mp4', 'video/webm', 'video/quicktime', 'video/x-m4v'])
+  const fileName = (file.name || '').toLowerCase()
+  const hasAllowedExtension = /\.(mp4|webm|mov|m4v)$/i.test(fileName)
+  const hasAllowedMime = file.type ? allowedMime.has(file.type) : false
+  if (!hasAllowedExtension && !hasAllowedMime) {
+    return c.json({ error: 'Invalid file type. Please upload MP4, WEBM, MOV, or M4V.' }, 400)
+  }
 
   const safeName = file.name.replace(/\s+/g, '-')
   const videoFilename = `${Date.now()}-${crypto.randomUUID()}-${safeName}`

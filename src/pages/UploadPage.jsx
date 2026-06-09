@@ -9,6 +9,7 @@ export default function UploadPage() {
   const [file, setFile] = useState(null)
   const [dragging, setDragging] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
   const [form, setForm] = useState({
     title: '',
     weapon: 'foil',
@@ -20,14 +21,23 @@ export default function UploadPage() {
     event.preventDefault()
     if (!file) return
 
+    const maxBytes = 95 * 1024 * 1024
+    if (file.size > maxBytes) {
+      setError('Video is too large. Cloudflare upload limit is about 100MB; please use a file under 95MB.')
+      return
+    }
+
     const body = new FormData()
     body.append('video', file)
     Object.entries(form).forEach(([k, v]) => body.append(k, v))
 
     setSaving(true)
+    setError('')
     try {
       const created = await api('/api/bouts', { method: 'POST', body })
       navigate(`/analyzer/${created.id}`)
+    } catch (err) {
+      setError(err.message || 'Upload failed. Please try again.')
     } finally {
       setSaving(false)
     }
@@ -49,6 +59,7 @@ export default function UploadPage() {
             e.preventDefault()
             setDragging(false)
             setFile(e.dataTransfer.files?.[0] || null)
+            setError('')
           }}
           className={`w-full border-2 border-dashed rounded-xl p-8 text-center transition ${
             dragging ? 'border-slate-200 bg-slate-800' : 'border-slate-600'
@@ -62,7 +73,10 @@ export default function UploadPage() {
           type="file"
           hidden
           accept="video/mp4,video/webm,video/quicktime"
-          onChange={(e) => setFile(e.target.files?.[0] || null)}
+          onChange={(e) => {
+            setFile(e.target.files?.[0] || null)
+            setError('')
+          }}
         />
 
         <div className="grid gap-3 md:grid-cols-2">
@@ -109,6 +123,8 @@ export default function UploadPage() {
             />
           </label>
         </div>
+
+        {error ? <p className="text-sm text-red-300 bg-red-500/10 border border-red-500/30 rounded p-2">{error}</p> : null}
 
         <button disabled={!file || saving} className="btn-primary disabled:opacity-50" type="submit">
           {saving ? 'Uploading...' : 'Create Bout'}
