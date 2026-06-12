@@ -1,5 +1,6 @@
 export async function api(path, options = {}) {
   const response = await fetch(path, {
+    credentials: 'include',
     headers: {
       ...(options.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
       ...(options.headers || {}),

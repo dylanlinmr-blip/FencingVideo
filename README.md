@@ -24,6 +24,10 @@
   - Save USA Fencing member ID/profile URL per fencer
   - Sync recent public results into local history
   - Display recent synced event name/date/score summaries
+- **User data isolation / privacy fix**:
+  - API data is partitioned by user identity headers when available
+  - Fallback to a secure per-browser owner cookie (`fv_owner_key`) when account headers are unavailable
+  - Bout lists, fencer data, calendar blocks, and upload retrieval are now owner-scoped
 - Cloudflare-native persistence:
   - **D1**: `bouts`, `touches`, `tip_marks`, `fencers`, `usafencing_results`, `calendar_blocks`
   - **R2**: uploaded video objects
@@ -57,12 +61,12 @@
 - `GET /uploads/:filename`
 
 ## Data Model
-- `bouts(id, title, weapon, left_name, right_name, video_filename, created_at, left_score, right_score)`
+- `bouts(id, title, weapon, left_name, right_name, video_filename, created_at, left_score, right_score, owner_key)`
 - `touches(id, bout_id, video_time_seconds, scorer, row_verdict, note, created_at)`
 - `tip_marks(id, bout_id, fencer, video_time_seconds, x_norm, y_norm, created_at)`
-- `fencers(id, name, usafencing_member_id, usafencing_profile_url, created_at)`
+- `fencers(id, name, owner_key, scoped_name, usafencing_member_id, usafencing_profile_url, created_at)`
 - `usafencing_results(id, fencer_id, event_name, event_date, score_summary, source_url, created_at)`
-- `calendar_blocks(id, title, start_time, end_time, location, notes, created_at)`
+- `calendar_blocks(id, title, start_time, end_time, location, notes, owner_key, created_at)`
 
 ## User Guide
 1. Upload a bout from **Upload** with left/right fencer names.
@@ -71,6 +75,7 @@
 4. Click **View Detail** for a dedicated fencer profile page.
 5. In the detail view (or tracker card), add USA Fencing profile URL and click **Save Link**.
 6. Click **Sync Recent Results** to pull latest public event/score summaries.
+7. Data visibility is now owner-scoped, so one user should not see another user's video library/fencer data.
 
 ## Local Development
 ```bash

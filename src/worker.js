@@ -1,4 +1,5 @@
 import { Hono } from 'hono'
+import { getCookie, setCookie } from 'hono/cookie'
 
 const app = new Hono()
 
@@ -22,7 +23,8 @@ async function ensureSchema(env) {
       video_filename TEXT NOT NULL,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       left_score INTEGER DEFAULT 0,
-      right_score INTEGER DEFAULT 0
+      right_score INTEGER DEFAULT 0,
+      owner_key TEXT NOT NULL DEFAULT 'global'
     )`
   ).run()
 
@@ -55,7 +57,9 @@ async function ensureSchema(env) {
   await env.DB.prepare(
     `CREATE TABLE IF NOT EXISTS fencers (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      owner_key TEXT NOT NULL DEFAULT 'global',
+      scoped_name TEXT UNIQUE,
       usafencing_member_id TEXT,
       usafencing_profile_url TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -83,10 +87,22 @@ async function ensureSchema(env) {
       end_time TEXT NOT NULL,
       location TEXT,
       notes TEXT,
+      owner_key TEXT NOT NULL DEFAULT 'global',
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )`
   ).run()
 
+  await ensureColumn(env, 'bouts', 'owner_key', "owner_key TEXT NOT NULL DEFAULT 'global'")
+  await ensureColumn(env, 'fencers', 'owner_key', "owner_key TEXT NOT NULL DEFAULT 'global'")
+  await ensureColumn(env, 'fencers', 'scoped_name', 'scoped_name TEXT')
+  await ensureColumn(env, 'calendar_blocks', 'owner_key', "owner_key TEXT NOT NULL DEFAULT 'global'")
+
+  await env.DB.prepare("UPDATE fencers SET scoped_name = owner_key || '::' || lower(name) WHERE scoped_name IS NULL OR scoped_name = ''").run()
+
+  await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS idx_fencers_scoped_name ON fencers(scoped_name)').run()
+  await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_bouts_owner_created ON bouts(owner_key, created_at)').run()
+  await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_fencers_owner_name ON fencers(owner_key, name)').run()
+  await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_calendar_blocks_owner_start ON calendar_blocks(owner_key, start_time)').run()
   await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_touches_bout_time ON touches(bout_id, video_time_seconds)').run()
   await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_tip_marks_bout_time ON tip_marks(bout_id, video_time_seconds)').run()
   await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_usafencing_results_fencer ON usafencing_results(fencer_id, event_date)').run()
@@ -127,12 +143,49 @@ function validateVideoFileInfo(filename, contentType) {
   return null
 }
 
-async function upsertFencer(env, rawName) {
+async function ensureColumn(env, table, columnName, columnDefinition) {
+  const info = await env.DB.prepare(`PRAGMA table_info(${table})`).all()
+  const exists = (info.results || []).some((column) => column.name === columnName)
+  if (!exists) {
+    await env.DB.prepare(`ALTER TABLE ${table} ADD COLUMN ${columnDefinition}`).run()
+  }
+}
+
+function getOwnerKey(c) {
+  const fromHeader =
+    c.req.header('x-user-id') ||
+    c.req.header('x-genspark-user-id') ||
+    c.req.header('x-auth-request-user') ||
+    c.req.header('cf-access-authenticated-user-email')
+
+  if (fromHeader) {
+    return String(fromHeader).trim().toLowerCase()
+  }
+
+  let cookieValue = getCookie(c, 'fv_owner_key')
+  if (!cookieValue) {
+    cookieValue = crypto.randomUUID()
+    setCookie(c, 'fv_owner_key', cookieValue, {
+      path: '/',
+      httpOnly: true,
+      sameSite: 'Lax',
+      secure: true,
+      maxAge: 60 * 60 * 24 * 365,
+    })
+  }
+
+  return String(cookieValue).trim().toLowerCase()
+}
+
+async function upsertFencer(env, ownerKey, rawName) {
   const name = String(rawName || '').trim()
   if (!name) return null
 
-  await env.DB.prepare('INSERT INTO fencers (name) VALUES (?) ON CONFLICT(name) DO NOTHING').bind(name).run()
-  return env.DB.prepare('SELECT * FROM fencers WHERE name = ?').bind(name).first()
+  const scopedName = `${ownerKey}::${name.toLowerCase()}`
+  await env.DB.prepare('INSERT INTO fencers (name, owner_key, scoped_name) VALUES (?, ?, ?) ON CONFLICT(scoped_name) DO NOTHING')
+    .bind(name, ownerKey, scopedName)
+    .run()
+  return env.DB.prepare('SELECT * FROM fencers WHERE scoped_name = ?').bind(scopedName).first()
 }
 
 function stripHtml(input) {
@@ -192,21 +245,29 @@ app.get('/api/health', (c) => c.json({ ok: true }))
 
 app.get('/api/bouts', async (c) => {
   await ensureSchema(c.env)
-  const { results } = await c.env.DB.prepare('SELECT * FROM bouts ORDER BY datetime(created_at) DESC, id DESC').all()
+  const ownerKey = getOwnerKey(c)
+  const { results } = await c.env.DB.prepare('SELECT * FROM bouts WHERE owner_key = ? ORDER BY datetime(created_at) DESC, id DESC')
+    .bind(ownerKey)
+    .all()
   return c.json(results.map((b) => ({ ...b, video_url: `/uploads/${b.video_filename}` })))
 })
 
-async function getFencerSummaries(env) {
+async function getFencerSummaries(env, ownerKey) {
   const boutsRes = await env.DB.prepare(
-    'SELECT id, title, weapon, left_name, right_name, left_score, right_score, created_at FROM bouts ORDER BY datetime(created_at) DESC, id DESC'
-  ).all()
-  const linksRes = await env.DB.prepare('SELECT * FROM fencers').all()
+    'SELECT id, title, weapon, left_name, right_name, left_score, right_score, created_at FROM bouts WHERE owner_key = ? ORDER BY datetime(created_at) DESC, id DESC'
+  )
+    .bind(ownerKey)
+    .all()
+  const linksRes = await env.DB.prepare('SELECT * FROM fencers WHERE owner_key = ?').bind(ownerKey).all()
   const usaRes = await env.DB.prepare(
     `SELECT f.name, r.id, r.event_name, r.event_date, r.score_summary, r.source_url, r.created_at
      FROM usafencing_results r
      JOIN fencers f ON f.id = r.fencer_id
+     WHERE f.owner_key = ?
      ORDER BY datetime(r.created_at) DESC, r.id DESC`
-  ).all()
+  )
+    .bind(ownerKey)
+    .all()
 
   const linksByName = new Map((linksRes.results || []).map((row) => [row.name, row]))
   const resultsByName = new Map()
@@ -273,13 +334,15 @@ async function getFencerSummaries(env) {
 
 app.get('/api/fencers', async (c) => {
   await ensureSchema(c.env)
-  return c.json(await getFencerSummaries(c.env))
+  const ownerKey = getOwnerKey(c)
+  return c.json(await getFencerSummaries(c.env, ownerKey))
 })
 
 app.get('/api/fencers/:name', async (c) => {
   await ensureSchema(c.env)
+  const ownerKey = getOwnerKey(c)
   const name = decodeURIComponent(c.req.param('name'))
-  const fencers = await getFencerSummaries(c.env)
+  const fencers = await getFencerSummaries(c.env, ownerKey)
   const fencer = fencers.find((entry) => entry.name === name)
   if (!fencer) return c.json({ error: 'Fencer not found' }, 404)
   return c.json(fencer)
@@ -287,25 +350,28 @@ app.get('/api/fencers/:name', async (c) => {
 
 app.post('/api/fencers/:name/usafencing-link', async (c) => {
   await ensureSchema(c.env)
+  const ownerKey = getOwnerKey(c)
   const name = decodeURIComponent(c.req.param('name'))
   const { member_id, profile_url } = await c.req.json()
 
   if (!name) return c.json({ error: 'Fencer name is required' }, 400)
 
-  await upsertFencer(c.env, name)
-  await c.env.DB.prepare('UPDATE fencers SET usafencing_member_id = ?, usafencing_profile_url = ? WHERE name = ?')
-    .bind(member_id ? String(member_id) : null, profile_url ? String(profile_url) : null, name)
+  const fencer = await upsertFencer(c.env, ownerKey, name)
+  await c.env.DB.prepare('UPDATE fencers SET usafencing_member_id = ?, usafencing_profile_url = ? WHERE id = ?')
+    .bind(member_id ? String(member_id) : null, profile_url ? String(profile_url) : null, fencer.id)
     .run()
 
-  const fencer = await c.env.DB.prepare('SELECT * FROM fencers WHERE name = ?').bind(name).first()
-  return c.json(fencer)
+  const updated = await c.env.DB.prepare('SELECT * FROM fencers WHERE id = ?').bind(fencer.id).first()
+  return c.json(updated)
 })
 
 app.post('/api/fencers/:name/usafencing-sync', async (c) => {
   await ensureSchema(c.env)
+  const ownerKey = getOwnerKey(c)
   const name = decodeURIComponent(c.req.param('name'))
 
-  const fencer = await c.env.DB.prepare('SELECT * FROM fencers WHERE name = ?').bind(name).first()
+  const scopedName = `${ownerKey}::${String(name).trim().toLowerCase()}`
+  const fencer = await c.env.DB.prepare('SELECT * FROM fencers WHERE scoped_name = ?').bind(scopedName).first()
   if (!fencer) return c.json({ error: 'Fencer not found' }, 404)
   if (!fencer.usafencing_profile_url) {
     return c.json({ error: 'Link a USA Fencing profile URL first.' }, 400)
@@ -336,12 +402,16 @@ app.post('/api/fencers/:name/usafencing-sync', async (c) => {
 
 app.get('/api/calendar/blocks', async (c) => {
   await ensureSchema(c.env)
-  const { results } = await c.env.DB.prepare('SELECT * FROM calendar_blocks ORDER BY datetime(start_time) ASC, id ASC').all()
+  const ownerKey = getOwnerKey(c)
+  const { results } = await c.env.DB.prepare('SELECT * FROM calendar_blocks WHERE owner_key = ? ORDER BY datetime(start_time) ASC, id ASC')
+    .bind(ownerKey)
+    .all()
   return c.json(results)
 })
 
 app.post('/api/calendar/blocks', async (c) => {
   await ensureSchema(c.env)
+  const ownerKey = getOwnerKey(c)
   const { title, start_time, end_time, location, notes } = await c.req.json()
 
   if (!title || !start_time || !end_time) {
@@ -349,9 +419,9 @@ app.post('/api/calendar/blocks', async (c) => {
   }
 
   const result = await c.env.DB.prepare(
-    'INSERT INTO calendar_blocks (title, start_time, end_time, location, notes) VALUES (?, ?, ?, ?, ?)'
+    'INSERT INTO calendar_blocks (title, start_time, end_time, location, notes, owner_key) VALUES (?, ?, ?, ?, ?, ?)'
   )
-    .bind(String(title), String(start_time), String(end_time), location ? String(location) : null, notes ? String(notes) : null)
+    .bind(String(title), String(start_time), String(end_time), location ? String(location) : null, notes ? String(notes) : null, ownerKey)
     .run()
 
   const created = await c.env.DB.prepare('SELECT * FROM calendar_blocks WHERE id = ?').bind(result.meta.last_row_id).first()
@@ -360,8 +430,9 @@ app.post('/api/calendar/blocks', async (c) => {
 
 app.delete('/api/calendar/blocks/:id', async (c) => {
   await ensureSchema(c.env)
+  const ownerKey = getOwnerKey(c)
   const id = Number(c.req.param('id'))
-  await c.env.DB.prepare('DELETE FROM calendar_blocks WHERE id = ?').bind(id).run()
+  await c.env.DB.prepare('DELETE FROM calendar_blocks WHERE id = ? AND owner_key = ?').bind(id, ownerKey).run()
   return c.json({ success: true })
 })
 
@@ -384,6 +455,7 @@ app.get('/api/usafencing/events', async (c) => {
 
 app.post('/api/bouts', async (c) => {
   await ensureSchema(c.env)
+  const ownerKey = getOwnerKey(c)
   const form = await c.req.formData()
   const file = form.get('video')
   const title = form.get('title')
@@ -407,13 +479,13 @@ app.post('/api/bouts', async (c) => {
   })
 
   const result = await c.env.DB.prepare(
-    'INSERT INTO bouts (title, weapon, left_name, right_name, video_filename) VALUES (?, ?, ?, ?, ?)'
+    'INSERT INTO bouts (title, weapon, left_name, right_name, video_filename, owner_key) VALUES (?, ?, ?, ?, ?, ?)'
   )
-    .bind(String(title), String(weapon), String(left_name), String(right_name), videoFilename)
+    .bind(String(title), String(weapon), String(left_name), String(right_name), videoFilename, ownerKey)
     .run()
 
-  await upsertFencer(c.env, left_name)
-  await upsertFencer(c.env, right_name)
+  await upsertFencer(c.env, ownerKey, left_name)
+  await upsertFencer(c.env, ownerKey, right_name)
 
   const bout = await c.env.DB.prepare('SELECT * FROM bouts WHERE id = ?').bind(result.meta.last_row_id).first()
   return c.json({ ...bout, video_url: `/uploads/${bout.video_filename}` }, 201)
@@ -421,6 +493,7 @@ app.post('/api/bouts', async (c) => {
 
 app.post('/api/uploads/init', async (c) => {
   await ensureSchema(c.env)
+  getOwnerKey(c)
 
   const { filename, contentType } = await c.req.json()
   if (!filename) {
@@ -465,6 +538,7 @@ app.put('/api/uploads/part', async (c) => {
 
 app.post('/api/uploads/complete', async (c) => {
   await ensureSchema(c.env)
+  const ownerKey = getOwnerKey(c)
 
   const { key, uploadId, parts, title, weapon, left_name, right_name } = await c.req.json()
 
@@ -489,13 +563,13 @@ app.post('/api/uploads/complete', async (c) => {
   await upload.complete(normalizedParts)
 
   const result = await c.env.DB.prepare(
-    'INSERT INTO bouts (title, weapon, left_name, right_name, video_filename) VALUES (?, ?, ?, ?, ?)'
+    'INSERT INTO bouts (title, weapon, left_name, right_name, video_filename, owner_key) VALUES (?, ?, ?, ?, ?, ?)'
   )
-    .bind(String(title), String(weapon), String(left_name), String(right_name), String(key))
+    .bind(String(title), String(weapon), String(left_name), String(right_name), String(key), ownerKey)
     .run()
 
-  await upsertFencer(c.env, left_name)
-  await upsertFencer(c.env, right_name)
+  await upsertFencer(c.env, ownerKey, left_name)
+  await upsertFencer(c.env, ownerKey, right_name)
 
   const bout = await c.env.DB.prepare('SELECT * FROM bouts WHERE id = ?').bind(result.meta.last_row_id).first()
   return c.json({ ...bout, video_url: `/uploads/${bout.video_filename}` }, 201)
@@ -514,9 +588,10 @@ app.post('/api/uploads/abort', async (c) => {
 
 app.get('/api/bouts/:id', async (c) => {
   await ensureSchema(c.env)
+  const ownerKey = getOwnerKey(c)
   const id = Number(c.req.param('id'))
 
-  const bout = await c.env.DB.prepare('SELECT * FROM bouts WHERE id = ?').bind(id).first()
+  const bout = await c.env.DB.prepare('SELECT * FROM bouts WHERE id = ? AND owner_key = ?').bind(id, ownerKey).first()
   if (!bout) return c.json({ error: 'Bout not found' }, 404)
 
   const touches = await c.env.DB.prepare(
@@ -541,9 +616,10 @@ app.get('/api/bouts/:id', async (c) => {
 
 app.delete('/api/bouts/:id', async (c) => {
   await ensureSchema(c.env)
+  const ownerKey = getOwnerKey(c)
   const id = Number(c.req.param('id'))
 
-  const bout = await c.env.DB.prepare('SELECT * FROM bouts WHERE id = ?').bind(id).first()
+  const bout = await c.env.DB.prepare('SELECT * FROM bouts WHERE id = ? AND owner_key = ?').bind(id, ownerKey).first()
   if (!bout) return c.json({ error: 'Bout not found' }, 404)
 
   await c.env.DB.prepare('DELETE FROM bouts WHERE id = ?').bind(id).run()
@@ -554,10 +630,11 @@ app.delete('/api/bouts/:id', async (c) => {
 
 app.post('/api/bouts/:id/touches', async (c) => {
   await ensureSchema(c.env)
+  const ownerKey = getOwnerKey(c)
   const boutId = Number(c.req.param('id'))
   const { video_time_seconds, scorer, row_verdict, note } = await c.req.json()
 
-  const exists = await c.env.DB.prepare('SELECT id FROM bouts WHERE id = ?').bind(boutId).first()
+  const exists = await c.env.DB.prepare('SELECT id FROM bouts WHERE id = ? AND owner_key = ?').bind(boutId, ownerKey).first()
   if (!exists) return c.json({ error: 'Bout not found' }, 404)
   if (video_time_seconds == null || !scorer) {
     return c.json({ error: 'video_time_seconds and scorer are required' }, 400)
@@ -577,9 +654,17 @@ app.post('/api/bouts/:id/touches', async (c) => {
 
 app.delete('/api/touches/:id', async (c) => {
   await ensureSchema(c.env)
+  const ownerKey = getOwnerKey(c)
   const touchId = Number(c.req.param('id'))
 
-  const touch = await c.env.DB.prepare('SELECT * FROM touches WHERE id = ?').bind(touchId).first()
+  const touch = await c.env.DB.prepare(
+    `SELECT t.*
+     FROM touches t
+     JOIN bouts b ON b.id = t.bout_id
+     WHERE t.id = ? AND b.owner_key = ?`
+  )
+    .bind(touchId, ownerKey)
+    .first()
   if (!touch) return c.json({ error: 'Touch not found' }, 404)
 
   await c.env.DB.prepare('DELETE FROM touches WHERE id = ?').bind(touchId).run()
@@ -589,12 +674,16 @@ app.delete('/api/touches/:id', async (c) => {
 
 app.post('/api/bouts/:id/tip-marks', async (c) => {
   await ensureSchema(c.env)
+  const ownerKey = getOwnerKey(c)
   const boutId = Number(c.req.param('id'))
   const { marks } = await c.req.json()
 
   if (!Array.isArray(marks) || marks.length === 0) {
     return c.json({ error: 'marks array is required' }, 400)
   }
+
+  const exists = await c.env.DB.prepare('SELECT id FROM bouts WHERE id = ? AND owner_key = ?').bind(boutId, ownerKey).first()
+  if (!exists) return c.json({ error: 'Bout not found' }, 404)
 
   const stmt = c.env.DB.prepare(
     'INSERT INTO tip_marks (bout_id, fencer, video_time_seconds, x_norm, y_norm) VALUES (?, ?, ?, ?, ?)'
@@ -615,12 +704,16 @@ app.post('/api/bouts/:id/tip-marks', async (c) => {
 
 app.delete('/api/bouts/:id/tip-marks', async (c) => {
   await ensureSchema(c.env)
+  const ownerKey = getOwnerKey(c)
   const boutId = Number(c.req.param('id'))
   const fencer = c.req.query('fencer')
 
   if (!fencer || !['left', 'right'].includes(fencer)) {
     return c.json({ error: 'fencer=left|right is required' }, 400)
   }
+
+  const exists = await c.env.DB.prepare('SELECT id FROM bouts WHERE id = ? AND owner_key = ?').bind(boutId, ownerKey).first()
+  if (!exists) return c.json({ error: 'Bout not found' }, 404)
 
   await c.env.DB.prepare('DELETE FROM tip_marks WHERE bout_id = ? AND fencer = ?').bind(boutId, fencer).run()
 
@@ -634,14 +727,22 @@ app.delete('/api/bouts/:id/tip-marks', async (c) => {
 })
 
 app.get('/uploads/:filename', async (c) => {
+  await ensureSchema(c.env)
+  const ownerKey = getOwnerKey(c)
   const key = c.req.param('filename')
+
+  const ownsVideo = await c.env.DB.prepare('SELECT id FROM bouts WHERE video_filename = ? AND owner_key = ? LIMIT 1')
+    .bind(key, ownerKey)
+    .first()
+  if (!ownsVideo) return c.notFound()
+
   const object = await c.env.VIDEOS.get(key)
   if (!object) return c.notFound()
 
   const headers = new Headers()
   object.writeHttpMetadata(headers)
   headers.set('etag', object.httpEtag)
-  headers.set('cache-control', 'public, max-age=31536000, immutable')
+  headers.set('cache-control', 'private, max-age=3600')
   return new Response(object.body, { headers })
 })
 
