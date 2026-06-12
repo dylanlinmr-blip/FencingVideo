@@ -7,13 +7,38 @@ export async function api(path, options = {}) {
     ...options,
   })
 
+  const contentType = response.headers.get('content-type') || ''
+
   if (!response.ok) {
-    const message = await response.text()
-    throw new Error(message || 'Request failed')
+    let parsedError = ''
+    try {
+      if (contentType.includes('application/json')) {
+        const payload = await response.json()
+        parsedError = payload?.error || payload?.message || ''
+      } else {
+        parsedError = await response.text()
+      }
+    } catch {
+      parsedError = ''
+    }
+
+    const normalized = String(parsedError || '').trim().toLowerCase()
+    if (response.status === 403 || normalized.includes('request denied')) {
+      throw new Error('Upload request was denied by the server. Please retry, and make sure you are using the working app link (with API enabled).')
+    }
+
+    throw new Error(parsedError || `Request failed (${response.status})`)
   }
 
   if (response.status === 204) return null
-  return response.json()
+
+  if (contentType.includes('application/json')) {
+    return response.json()
+  }
+
+  throw new Error(
+    `API is unavailable on this link (${path}). Please open the app URL that includes backend API support.`
+  )
 }
 
 export const formatClock = (seconds) => {

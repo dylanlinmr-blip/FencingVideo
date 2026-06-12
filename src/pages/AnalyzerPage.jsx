@@ -16,6 +16,7 @@ import { api, formatClock } from '../lib/api'
 import { evaluateRow, rowHints } from '../lib/rowDecision'
 
 const fps = 30
+const PRE_TOUCH_OFFSET_KEY = 'fencevision.preTouchOffsetSeconds'
 
 export default function AnalyzerPage() {
   const { id } = useParams()
@@ -27,9 +28,17 @@ export default function AnalyzerPage() {
   const [isPlaying, setIsPlaying] = useState(false)
   const [speed, setSpeed] = useState(1)
   const [fadeSeconds, setFadeSeconds] = useState(1.5)
+  const [preTouchSeconds, setPreTouchSeconds] = useState(() => {
+    if (typeof window === 'undefined') return 1
+    const saved = window.localStorage.getItem(PRE_TOUCH_OFFSET_KEY)
+    const parsed = Number(saved)
+    return parsed === 1 || parsed === 1.5 ? parsed : 1
+  })
+  const [defaultOffsetSaved, setDefaultOffsetSaved] = useState(false)
   const [markMode, setMarkMode] = useState(false)
   const [markFencer, setMarkFencer] = useState('left')
   const [noteDraft, setNoteDraft] = useState('')
+  const [touchSaving, setTouchSaving] = useState(false)
   const [answers, setAnswers] = useState({
     step1AttackEstablished: 'yes',
     step1Initiator: 'left',
@@ -38,6 +47,18 @@ export default function AnalyzerPage() {
   const loadBout = async () => {
     const data = await api(`/api/bouts/${id}`)
     setBout(data)
+  }
+
+  const saveOffsetAsDefault = () => {
+    window.localStorage.setItem(PRE_TOUCH_OFFSET_KEY, String(preTouchSeconds))
+    setDefaultOffsetSaved(true)
+    window.setTimeout(() => setDefaultOffsetSaved(false), 1400)
+  }
+
+  const resetOffsetDefault = () => {
+    window.localStorage.removeItem(PRE_TOUCH_OFFSET_KEY)
+    setPreTouchSeconds(1)
+    setDefaultOffsetSaved(false)
   }
 
   useEffect(() => {
@@ -172,30 +193,89 @@ export default function AnalyzerPage() {
     }
   }, [bout])
 
-  const saveTouch = async () => {
-    if (!bout) return
-    const row = evaluateRow(bout.weapon, answers)
-    const res = await api(`/api/bouts/${bout.id}/touches`, {
-      method: 'POST',
-      body: JSON.stringify({
-        video_time_seconds: videoRef.current.currentTime,
-        scorer: row.scorer,
-        row_verdict: row.verdict,
-        note: noteDraft,
-      }),
-    })
+  const saveTouch = async (override = null) => {
+    if (!bout || !videoRef.current || touchSaving) return
 
-    setBout((prev) => ({ ...prev, touches: [...prev.touches, res.touch] }))
-    setNoteDraft('')
-    setActiveTab('touches')
+    const row = evaluateRow(bout.weapon, answers)
+    const scorer = override?.scorer ?? row.scorer
+    const verdict = override?.verdict ?? row.verdict
+    const awardTime = videoRef.current.currentTime
+    const touchTime = Math.max(0, awardTime - preTouchSeconds)
+
+    setTouchSaving(true)
+    try {
+      const res = await api(`/api/bouts/${bout.id}/touches`, {
+        method: 'POST',
+        body: JSON.stringify({
+          video_time_seconds: touchTime,
+          scorer,
+          row_verdict: verdict,
+          note: noteDraft,
+        }),
+      })
+
+      let nextTipMarks = bout.tip_marks
+      if (scorer === 'left' || scorer === 'right') {
+        const latestMark = [...bout.tip_marks]
+          .filter((m) => m.fencer === scorer && m.video_time_seconds <= awardTime)
+          .sort((a, b) => b.video_time_seconds - a.video_time_seconds)[0]
+
+        if (latestMark && touchTime < awardTime) {
+          const markRes = await api(`/api/bouts/${bout.id}/tip-marks`, {
+            method: 'POST',
+            body: JSON.stringify({
+              marks: [
+                {
+                  fencer: scorer,
+                  video_time_seconds: touchTime,
+                  x_norm: latestMark.x_norm,
+                  y_norm: latestMark.y_norm,
+                },
+              ],
+            }),
+          })
+          nextTipMarks = markRes.tip_marks
+        }
+      }
+
+      setBout((prev) => ({ ...prev, touches: [...prev.touches, res.touch], tip_marks: nextTipMarks }))
+      setNoteDraft('')
+      setActiveTab('touches')
+    } finally {
+      setTouchSaving(false)
+    }
   }
 
   const undoLastTouch = async () => {
-    if (!bout?.touches?.length) return
+    if (!bout?.touches?.length || touchSaving) return
     const last = [...bout.touches].sort((a, b) => b.id - a.id)[0]
     await api(`/api/touches/${last.id}`, { method: 'DELETE' })
     await loadBout()
   }
+
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      const tag = document.activeElement?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || event.repeat) return
+
+      if (event.key === '1') {
+        event.preventDefault()
+        saveTouch({ scorer: 'left', verdict: `POINT LEFT (QUICK ADD)` })
+      } else if (event.key === '2') {
+        event.preventDefault()
+        saveTouch({ scorer: 'right', verdict: `POINT RIGHT (QUICK ADD)` })
+      } else if (event.key === '0') {
+        event.preventDefault()
+        saveTouch({ scorer: 'none', verdict: 'NO TOUCH (QUICK ADD)' })
+      } else if (event.key.toLowerCase() === 'u') {
+        event.preventDefault()
+        undoLastTouch()
+      }
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [saveTouch, undoLastTouch])
 
   if (!bout) return <div className="text-slate-400">Loading bout...</div>
 
@@ -436,10 +516,65 @@ export default function AnalyzerPage() {
                 </>
               )}
 
-              <div className="glass p-2 text-xs">
-                Final verdict: <span className="font-semibold">{rowResult.verdict}</span>
+              <div className="glass p-2 text-xs space-y-2">
+                <div>
+                  Final verdict: <span className="font-semibold">{rowResult.verdict}</span>
+                </div>
+                <label className="flex items-center justify-between gap-2">
+                  <span>AI pre-point trail offset</span>
+                  <select
+                    value={String(preTouchSeconds)}
+                    onChange={(e) => setPreTouchSeconds(Number(e.target.value))}
+                    className="bg-slate-900 border border-slate-700 rounded px-2 py-1"
+                  >
+                    <option value="0">0s (none)</option>
+                    <option value="1">1.0s</option>
+                    <option value="1.5">1.5s</option>
+                  </select>
+                </label>
+                <div className="flex gap-2">
+                  <button type="button" className="btn-ghost text-xs" onClick={saveOffsetAsDefault}>
+                    Save as default
+                  </button>
+                  <button type="button" className="btn-ghost text-xs" onClick={resetOffsetDefault}>
+                    Reset default
+                  </button>
+                </div>
+                {defaultOffsetSaved ? <p className="text-emerald-300">Default offset saved.</p> : null}
+                <p className="text-slate-400">
+                  Touch is saved at <span className="font-medium">{formatClock(Math.max(0, currentTime - preTouchSeconds))}</span> while award moment is {formatClock(currentTime)}.
+                </p>
               </div>
-              <button className="btn-primary" onClick={saveTouch}>Record Touch</button>
+
+              <button className="btn-primary w-full" onClick={() => saveTouch()} disabled={touchSaving}>
+                {touchSaving ? 'Saving touch...' : 'Record ROW Touch'}
+              </button>
+
+              <div className="grid grid-cols-3 gap-2">
+                <button
+                  className="btn-ghost border border-red-500/30"
+                  onClick={() => saveTouch({ scorer: 'left', verdict: 'POINT LEFT (QUICK ADD)' })}
+                  disabled={touchSaving}
+                >
+                  Left +1
+                </button>
+                <button
+                  className="btn-ghost border border-green-500/30"
+                  onClick={() => saveTouch({ scorer: 'right', verdict: 'POINT RIGHT (QUICK ADD)' })}
+                  disabled={touchSaving}
+                >
+                  Right +1
+                </button>
+                <button
+                  className="btn-ghost"
+                  onClick={() => saveTouch({ scorer: 'none', verdict: 'NO TOUCH (QUICK ADD)' })}
+                  disabled={touchSaving}
+                >
+                  No Touch
+                </button>
+              </div>
+
+              <p className="text-xs text-slate-400">Hotkeys: 1=Left, 2=Right, 0=No Touch, U=Undo</p>
             </div>
           )}
 
@@ -489,7 +624,31 @@ export default function AnalyzerPage() {
                   <div className="text-3xl font-bold text-green-300">{touchScore.right}</div>
                 </div>
               </div>
-              <button className="btn-ghost" onClick={undoLastTouch}><Undo2 size={16} /> Undo last touch</button>
+              <div className="grid grid-cols-3 gap-2 text-xs">
+                <button
+                  className="btn-ghost border border-red-500/30"
+                  onClick={() => saveTouch({ scorer: 'left', verdict: 'POINT LEFT (QUICK ADD)' })}
+                  disabled={touchSaving}
+                >
+                  Left +1
+                </button>
+                <button
+                  className="btn-ghost border border-green-500/30"
+                  onClick={() => saveTouch({ scorer: 'right', verdict: 'POINT RIGHT (QUICK ADD)' })}
+                  disabled={touchSaving}
+                >
+                  Right +1
+                </button>
+                <button
+                  className="btn-ghost"
+                  onClick={() => saveTouch({ scorer: 'none', verdict: 'NO TOUCH (QUICK ADD)' })}
+                  disabled={touchSaving}
+                >
+                  No Touch
+                </button>
+              </div>
+              <p className="text-xs text-slate-400">Touch timing offset: {preTouchSeconds}s before current playhead</p>
+              <button className="btn-ghost" onClick={undoLastTouch} disabled={touchSaving}><Undo2 size={16} /> Undo last touch</button>
               <div className="max-h-80 overflow-auto text-xs space-y-2">
                 {bout.touches.length === 0 ? (
                   <p className="text-slate-400">No touches recorded yet.</p>

@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "npm run build && wrangler pages dev dist --functions functions --d1=DB --r2=VIDEOS --local --ip 0.0.0.0 --port 3000",
+    "dev": "npm run build && wrangler dev --local --ip 0.0.0.0 --port 3000",
     "dev:ui": "vite --host 0.0.0.0 --port 3000",
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0 --port 3000"

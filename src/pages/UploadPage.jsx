@@ -3,12 +3,15 @@ import { useNavigate } from 'react-router-dom'
 import { UploadCloud } from 'lucide-react'
 import { api } from '../lib/api'
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
 export default function UploadPage() {
   const navigate = useNavigate()
   const inputRef = useRef(null)
   const [file, setFile] = useState(null)
   const [dragging, setDragging] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [uploadProgress, setUploadProgress] = useState(0)
   const [error, setError] = useState('')
   const [form, setForm] = useState({
     title: '',
@@ -17,27 +20,99 @@ export default function UploadPage() {
     right_name: 'Right Fencer',
   })
 
+  const uploadPartWithRetry = async ({ key, uploadId, partNumber, chunk, maxRetries = 3 }) => {
+    let lastError = null
+
+    for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
+      try {
+        return await api(
+          `/api/uploads/part?key=${encodeURIComponent(key)}&uploadId=${encodeURIComponent(uploadId)}&partNumber=${partNumber}`,
+          {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: chunk,
+          }
+        )
+      } catch (err) {
+        lastError = err
+        if (attempt < maxRetries) {
+          await sleep(500 * attempt)
+        }
+      }
+    }
+
+    throw new Error(lastError?.message || `Failed to upload chunk #${partNumber}`)
+  }
+
   const submit = async (event) => {
     event.preventDefault()
     if (!file) return
 
-    const maxBytes = 95 * 1024 * 1024
-    if (file.size > maxBytes) {
-      setError('Video is too large. Cloudflare upload limit is about 100MB; please use a file under 95MB.')
-      return
-    }
-
-    const body = new FormData()
-    body.append('video', file)
-    Object.entries(form).forEach(([k, v]) => body.append(k, v))
+    const chunkSize = 5 * 1024 * 1024
+    let uploadSession = null
 
     setSaving(true)
+    setUploadProgress(0)
     setError('')
+
     try {
-      const created = await api('/api/bouts', { method: 'POST', body })
+      uploadSession = await api('/api/uploads/init', {
+        method: 'POST',
+        body: JSON.stringify({
+          filename: file.name,
+          contentType: file.type || 'application/octet-stream',
+        }),
+      })
+
+      const totalParts = Math.ceil(file.size / chunkSize)
+      const parts = []
+
+      for (let index = 0; index < totalParts; index += 1) {
+        const partNumber = index + 1
+        const start = index * chunkSize
+        const end = Math.min(start + chunkSize, file.size)
+        const chunk = file.slice(start, end)
+
+        const uploadedPart = await uploadPartWithRetry({
+          key: uploadSession.key,
+          uploadId: uploadSession.uploadId,
+          partNumber,
+          chunk,
+        })
+
+        parts.push({ partNumber, etag: uploadedPart.etag })
+        setUploadProgress(Math.round((partNumber / totalParts) * 100))
+      }
+
+      const created = await api('/api/uploads/complete', {
+        method: 'POST',
+        body: JSON.stringify({
+          key: uploadSession.key,
+          uploadId: uploadSession.uploadId,
+          parts,
+          ...form,
+        }),
+      })
+
       navigate(`/analyzer/${created.id}`)
     } catch (err) {
-      setError(err.message || 'Upload failed. Please try again.')
+      if (uploadSession?.key && uploadSession?.uploadId) {
+        try {
+          await api('/api/uploads/abort', {
+            method: 'POST',
+            body: JSON.stringify({ key: uploadSession.key, uploadId: uploadSession.uploadId }),
+          })
+        } catch {
+          // Ignore abort failures; surface original upload error instead.
+        }
+      }
+
+      const normalizedError = String(err?.message || '').toLowerCase()
+      if (normalizedError.includes('request denied')) {
+        setError('Upload request was denied. We now upload in 5MB chunks with retries, but this still requires a working API-enabled deployment link.')
+      } else {
+        setError(err.message || 'Upload failed. Please try again.')
+      }
     } finally {
       setSaving(false)
     }
@@ -59,6 +134,7 @@ export default function UploadPage() {
             e.preventDefault()
             setDragging(false)
             setFile(e.dataTransfer.files?.[0] || null)
+            setUploadProgress(0)
             setError('')
           }}
           className={`w-full border-2 border-dashed rounded-xl p-8 text-center transition ${
@@ -75,6 +151,7 @@ export default function UploadPage() {
           accept="video/mp4,video/webm,video/quicktime"
           onChange={(e) => {
             setFile(e.target.files?.[0] || null)
+            setUploadProgress(0)
             setError('')
           }}
         />
@@ -124,10 +201,16 @@ export default function UploadPage() {
           </label>
         </div>
 
+        {saving ? (
+          <p className="text-sm text-slate-200 bg-slate-800/60 border border-slate-600 rounded p-2">
+            Uploading in chunks... {uploadProgress}%
+          </p>
+        ) : null}
+
         {error ? <p className="text-sm text-red-300 bg-red-500/10 border border-red-500/30 rounded p-2">{error}</p> : null}
 
         <button disabled={!file || saving} className="btn-primary disabled:opacity-50" type="submit">
-          {saving ? 'Uploading...' : 'Create Bout'}
+          {saving ? `Uploading ${uploadProgress}%` : 'Create Bout'}
         </button>
       </form>
     </section>
