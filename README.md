@@ -20,6 +20,10 @@
   - Aggregates every fencer entered on left/right side of bouts
   - Shows complete linked bout history per fencer
   - Shows bout count and most recent bout date per fencer
+- **AI scouting report for saved fencers**:
+  - Generates style breakdown from saved bout/touch/ROW data
+  - Highlights likely strengths and tempo patterns
+  - Produces practical "how to fence them" recommendations
 - **USA Fencing profile linking**:
   - Save USA Fencing member ID/profile URL per fencer
   - Sync recent public results into local history
@@ -52,6 +56,7 @@
 - `DELETE /api/bouts/:id/tip-marks?fencer=left|right`
 - `GET /api/fencers`
 - `GET /api/fencers/:name`
+- `GET /api/fencers/:name/scouting-report`
 - `POST /api/fencers/:name/usafencing-link`
 - `POST /api/fencers/:name/usafencing-sync`
 - `GET /api/usafencing/events`
@@ -75,7 +80,8 @@
 4. Click **View Detail** for a dedicated fencer profile page.
 5. In the detail view (or tracker card), add USA Fencing profile URL and click **Save Link**.
 6. Click **Sync Recent Results** to pull latest public event/score summaries.
-7. Data visibility is now owner-scoped, so one user should not see another user's video library/fencer data.
+7. On a fencer detail page, click **Analyze Fencing Style** for an AI scouting breakdown and tactical recommendations.
+8. Data visibility is now owner-scoped, so one user should not see another user's video library/fencer data.
 
 ## Local Development
 ```bash
@@ -101,4 +107,4 @@ npm run dev
 ## Deployment Status
 - **Platform**: Genspark-hosted Cloudflare Worker + D1 + R2
 - **Status**: ✅ Active
-- **Last Updated**: 2026-06-12
+- **Last Updated**: 2026-06-16

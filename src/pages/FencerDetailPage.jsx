@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { ArrowLeft, ExternalLink, RefreshCw, Save, UserRound } from 'lucide-react'
+import { ArrowLeft, Brain, ExternalLink, RefreshCw, Save, UserRound } from 'lucide-react'
 import { api } from '../lib/api'
 
 function formatDate(value) {
@@ -19,6 +19,8 @@ export default function FencerDetailPage() {
   const [draft, setDraft] = useState({ member_id: '', profile_url: '' })
   const [saving, setSaving] = useState(false)
   const [syncing, setSyncing] = useState(false)
+  const [scoutingReport, setScoutingReport] = useState(null)
+  const [scoutingLoading, setScoutingLoading] = useState(false)
 
   const loadFencer = async () => {
     setLoading(true)
@@ -30,6 +32,7 @@ export default function FencerDetailPage() {
         member_id: row.usafencing_member_id || '',
         profile_url: row.usafencing_profile_url || '',
       })
+      setScoutingReport(null)
     } catch (error) {
       setMessage(error.message)
       setFencer(null)
@@ -78,6 +81,20 @@ export default function FencerDetailPage() {
       setMessage(error.message)
     } finally {
       setSyncing(false)
+    }
+  }
+
+  const loadScoutingReport = async () => {
+    if (!fencer) return
+    setScoutingLoading(true)
+    setMessage('')
+    try {
+      const report = await api(`/api/fencers/${encodeURIComponent(fencer.name)}/scouting-report`)
+      setScoutingReport(report)
+    } catch (error) {
+      setMessage(error.message)
+    } finally {
+      setScoutingLoading(false)
     }
   }
 
@@ -173,6 +190,80 @@ export default function FencerDetailPage() {
           )}
         </article>
       </div>
+
+      <article className="glass p-4 space-y-3">
+        <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+          <h2 className="font-semibold flex items-center gap-2">
+            <Brain size={18} className="text-accentRed" />
+            AI Scouting Breakdown
+          </h2>
+          <button className="btn-primary" onClick={loadScoutingReport} disabled={scoutingLoading}>
+            {scoutingLoading ? 'Analyzing…' : 'Analyze Fencing Style'}
+          </button>
+        </div>
+
+        {scoutingReport ? (
+          <div className="space-y-3 text-sm">
+            <p className="text-slate-200">{scoutingReport.ai_summary}</p>
+            <p className="text-xs text-slate-400">Confidence: {scoutingReport.confidence}</p>
+
+            {scoutingReport.style_signals?.length ? (
+              <div>
+                <h3 className="font-medium mb-1">Style Signals</h3>
+                <ul className="list-disc pl-5 space-y-1 text-slate-300">
+                  {scoutingReport.style_signals.map((signal) => (
+                    <li key={signal}>{signal}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+
+            <div>
+              <h3 className="font-medium mb-1">How to Fence Them</h3>
+              <ul className="list-disc pl-5 space-y-1 text-slate-300">
+                {(scoutingReport.how_to_fence_them || []).map((tip) => (
+                  <li key={tip}>{tip}</li>
+                ))}
+              </ul>
+            </div>
+
+            <div className="grid md:grid-cols-3 gap-2">
+              <div className="bg-slate-900/50 rounded-lg p-2">
+                <p className="text-xs text-slate-400">Win Rate</p>
+                <p className="font-semibold">{Math.round((scoutingReport.win_rate || 0) * 100)}%</p>
+              </div>
+              <div className="bg-slate-900/50 rounded-lg p-2">
+                <p className="text-xs text-slate-400">Opening Touch Rate</p>
+                <p className="font-semibold">{Math.round((scoutingReport.opening_touch_rate || 0) * 100)}%</p>
+              </div>
+              <div className="bg-slate-900/50 rounded-lg p-2">
+                <p className="text-xs text-slate-400">Avg Touch Diff</p>
+                <p className="font-semibold">
+                  {(scoutingReport.average_scored_per_bout || 0) - (scoutingReport.average_conceded_per_bout || 0) > 0 ? '+' : ''}
+                  {((scoutingReport.average_scored_per_bout || 0) - (scoutingReport.average_conceded_per_bout || 0)).toFixed(2)}
+                </p>
+              </div>
+            </div>
+
+            {scoutingReport.row_style_breakdown?.length ? (
+              <div>
+                <h3 className="font-medium mb-1">ROW / Scoring Style Mix</h3>
+                <ul className="space-y-1">
+                  {scoutingReport.row_style_breakdown.map((item) => (
+                    <li key={item.style} className="text-slate-300 text-xs">
+                      {item.style}: {item.count} touches ({Math.round((item.share || 0) * 100)}%)
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+          </div>
+        ) : (
+          <p className="text-sm text-slate-400">
+            Run analysis to generate an AI-style scouting report from saved bouts, touches, and ROW verdict trends.
+          </p>
+        )}
+      </article>
 
       <article className="glass p-4 space-y-2">
         <h2 className="font-semibold">Recent USA Fencing Results</h2>

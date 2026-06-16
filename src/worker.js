@@ -241,6 +241,208 @@ function parseUsaFencingResults(html, sourceUrl) {
   return results.slice(0, 20)
 }
 
+function classifyRowVerdict(verdict) {
+  const text = String(verdict || '').toUpperCase()
+  if (!text) return 'Unknown'
+  if (text.includes('PARRY-RIPOSTE')) return 'Parry-Riposte'
+  if (text.includes('REMISE')) return 'Remise'
+  if (text.includes('INITIAL ATTACK')) return 'Initial Attack'
+  if (text.includes('ATTACK AFTER FAIL')) return 'Attack After Fail'
+  if (text.includes('EPEE TOUCH')) return 'Epee Touch'
+  if (text.includes('SIMULTANEOUS')) return 'Simultaneous'
+  return 'Other'
+}
+
+function buildScoutingRecommendations(report) {
+  const recommendations = []
+  const styleSignals = []
+
+  if (report.win_rate >= 0.65 && report.total_bouts >= 4) {
+    styleSignals.push('High-confidence closer in full bouts')
+  }
+
+  const attackShare = report.row_style_breakdown.find((item) => item.style === 'Initial Attack')?.share || 0
+  const riposteShare = report.row_style_breakdown.find((item) => item.style === 'Parry-Riposte')?.share || 0
+
+  if (attackShare >= 0.35) {
+    recommendations.push('Disrupt distance early and force second-intention actions; this fencer scores often off initial attacks.')
+  }
+
+  if (riposteShare >= 0.25) {
+    recommendations.push('Avoid telegraphed attacks. Use feints and tempo breaks to draw the parry before finishing.')
+  }
+
+  if (report.opening_touch_rate >= 0.6) {
+    recommendations.push('Start each period with extra discipline—this fencer frequently takes the first touch.')
+  } else if (report.opening_touch_rate <= 0.35 && report.total_bouts > 0) {
+    recommendations.push('Apply controlled early pressure; they are less likely to secure the opening touch.')
+  }
+
+  if (report.average_scored_per_bout > report.average_conceded_per_bout) {
+    recommendations.push('Primary threat is sustained scoring volume. Force low-scoring exchanges and stop momentum chains.')
+  } else {
+    recommendations.push('Defensive opportunities exist—build actions that finish cleanly after preparation.')
+  }
+
+  if (report.tempo_seconds_per_scoring_touch && report.tempo_seconds_per_scoring_touch < 18) {
+    recommendations.push('Slow the rhythm between halts. Rapid restart tempo appears to favor this fencer.')
+  }
+
+  if (recommendations.length === 0) {
+    recommendations.push('Limited data available. Fence fundamentally: control distance, vary preparation, and avoid predictable timing.')
+  }
+
+  return {
+    style_signals: styleSignals,
+    recommendations: recommendations.slice(0, 6),
+  }
+}
+
+async function buildFencerScoutingReport(env, ownerKey, fencerName) {
+  const name = String(fencerName || '').trim()
+  if (!name) return null
+
+  const boutsRes = await env.DB.prepare(
+    `SELECT id, title, weapon, left_name, right_name, left_score, right_score, created_at
+     FROM bouts
+     WHERE owner_key = ? AND (left_name = ? OR right_name = ?)
+     ORDER BY datetime(created_at) DESC, id DESC`
+  )
+    .bind(ownerKey, name, name)
+    .all()
+
+  const bouts = boutsRes.results || []
+  if (bouts.length === 0) {
+    return {
+      fencer_name: name,
+      total_bouts: 0,
+      total_touches_scored: 0,
+      total_touches_conceded: 0,
+      win_rate: 0,
+      opening_touch_rate: 0,
+      average_scored_per_bout: 0,
+      average_conceded_per_bout: 0,
+      tempo_seconds_per_scoring_touch: null,
+      weapon_breakdown: [],
+      row_style_breakdown: [],
+      opponent_breakdown: [],
+      ai_summary: 'No bout data yet for this fencer.',
+      how_to_fence_them: ['Record at least one analyzed bout with touches to generate scouting recommendations.'],
+      confidence: 'low',
+    }
+  }
+
+  let wins = 0
+  let losses = 0
+  let draws = 0
+  let openingTouchesWon = 0
+  let scoringTouches = 0
+  let concededTouches = 0
+  let scoringTempoTotal = 0
+  let scoringTempoCount = 0
+
+  const rowStyleCounts = new Map()
+  const weaponStats = new Map()
+  const opponentStats = new Map()
+
+  for (const bout of bouts) {
+    const isLeft = bout.left_name === name
+    const ownScore = Number(isLeft ? bout.left_score : bout.right_score) || 0
+    const oppScore = Number(isLeft ? bout.right_score : bout.left_score) || 0
+    const opponent = isLeft ? bout.right_name : bout.left_name
+
+    if (ownScore > oppScore) wins += 1
+    else if (ownScore < oppScore) losses += 1
+    else draws += 1
+
+    const weaponEntry = weaponStats.get(bout.weapon) || { weapon: bout.weapon, bouts: 0, wins: 0, losses: 0, draws: 0 }
+    weaponEntry.bouts += 1
+    if (ownScore > oppScore) weaponEntry.wins += 1
+    else if (ownScore < oppScore) weaponEntry.losses += 1
+    else weaponEntry.draws += 1
+    weaponStats.set(bout.weapon, weaponEntry)
+
+    const opponentEntry = opponentStats.get(opponent) || { opponent, bouts: 0, wins: 0, losses: 0, draws: 0 }
+    opponentEntry.bouts += 1
+    if (ownScore > oppScore) opponentEntry.wins += 1
+    else if (ownScore < oppScore) opponentEntry.losses += 1
+    else opponentEntry.draws += 1
+    opponentStats.set(opponent, opponentEntry)
+
+    const touchesRes = await env.DB.prepare(
+      'SELECT scorer, row_verdict, video_time_seconds FROM touches WHERE bout_id = ? ORDER BY video_time_seconds ASC, id ASC'
+    )
+      .bind(bout.id)
+      .all()
+
+    let firstScoringTouchSeen = false
+    let firstOwnScoringTime = null
+
+    for (const touch of touchesRes.results || []) {
+      const scorer = touch.scorer
+      const isOwnTouch = (isLeft && scorer === 'left') || (!isLeft && scorer === 'right')
+      const isOppTouch = (isLeft && scorer === 'right') || (!isLeft && scorer === 'left')
+
+      if (!firstScoringTouchSeen && (isOwnTouch || isOppTouch)) {
+        firstScoringTouchSeen = true
+        if (isOwnTouch) openingTouchesWon += 1
+      }
+
+      if (isOwnTouch) {
+        scoringTouches += 1
+        const style = classifyRowVerdict(touch.row_verdict)
+        rowStyleCounts.set(style, (rowStyleCounts.get(style) || 0) + 1)
+
+        const touchTime = Number(touch.video_time_seconds)
+        if (Number.isFinite(touchTime)) {
+          if (firstOwnScoringTime != null) {
+            scoringTempoTotal += Math.max(0, touchTime - firstOwnScoringTime)
+            scoringTempoCount += 1
+          }
+          firstOwnScoringTime = touchTime
+        }
+      }
+
+      if (isOppTouch) {
+        concededTouches += 1
+      }
+    }
+  }
+
+  const totalBouts = bouts.length
+  const rowStyleBreakdown = [...rowStyleCounts.entries()]
+    .map(([style, count]) => ({ style, count, share: scoringTouches ? Number((count / scoringTouches).toFixed(3)) : 0 }))
+    .sort((a, b) => b.count - a.count)
+
+  const winRate = totalBouts ? wins / totalBouts : 0
+  const openingTouchRate = totalBouts ? openingTouchesWon / totalBouts : 0
+  const report = {
+    fencer_name: name,
+    total_bouts: totalBouts,
+    wins,
+    losses,
+    draws,
+    win_rate: Number(winRate.toFixed(3)),
+    total_touches_scored: scoringTouches,
+    total_touches_conceded: concededTouches,
+    opening_touch_rate: Number(openingTouchRate.toFixed(3)),
+    average_scored_per_bout: Number((scoringTouches / totalBouts).toFixed(2)),
+    average_conceded_per_bout: Number((concededTouches / totalBouts).toFixed(2)),
+    tempo_seconds_per_scoring_touch: scoringTempoCount ? Number((scoringTempoTotal / scoringTempoCount).toFixed(2)) : null,
+    weapon_breakdown: [...weaponStats.values()].sort((a, b) => b.bouts - a.bouts),
+    row_style_breakdown: rowStyleBreakdown,
+    opponent_breakdown: [...opponentStats.values()].sort((a, b) => b.bouts - a.bouts).slice(0, 10),
+    confidence: scoringTouches >= 20 || totalBouts >= 5 ? 'medium' : 'low',
+  }
+
+  const insights = buildScoutingRecommendations(report)
+  report.ai_summary = `${name} has a ${Math.round(report.win_rate * 100)}% win rate across ${report.total_bouts} bout(s), averaging ${report.average_scored_per_bout} scored vs ${report.average_conceded_per_bout} conceded touches.`
+  report.style_signals = insights.style_signals
+  report.how_to_fence_them = insights.recommendations
+
+  return report
+}
+
 app.get('/api/health', (c) => c.json({ ok: true }))
 
 app.get('/api/bouts', async (c) => {
@@ -346,6 +548,15 @@ app.get('/api/fencers/:name', async (c) => {
   const fencer = fencers.find((entry) => entry.name === name)
   if (!fencer) return c.json({ error: 'Fencer not found' }, 404)
   return c.json(fencer)
+})
+
+app.get('/api/fencers/:name/scouting-report', async (c) => {
+  await ensureSchema(c.env)
+  const ownerKey = getOwnerKey(c)
+  const name = decodeURIComponent(c.req.param('name'))
+  const report = await buildFencerScoutingReport(c.env, ownerKey, name)
+  if (!report) return c.json({ error: 'Fencer not found' }, 404)
+  return c.json(report)
 })
 
 app.post('/api/fencers/:name/usafencing-link', async (c) => {
