@@ -7,6 +7,7 @@ import AnalyzerPage from './pages/AnalyzerPage'
 import AboutPage from './pages/AboutPage'
 import FencersPage from './pages/FencersPage'
 import FencerDetailPage from './pages/FencerDetailPage'
+import CalendarPage from './pages/CalendarPage'
 
 export default function App() {
   return (
@@ -19,6 +20,7 @@ export default function App() {
             <Route path="/upload" element={<UploadPage />} />
             <Route path="/fencers" element={<FencersPage />} />
             <Route path="/fencers/:name" element={<FencerDetailPage />} />
+            <Route path="/calendar" element={<CalendarPage />} />
             <Route path="/analyzer/:id" element={<AnalyzerPage />} />
             <Route path="/about" element={<AboutPage />} />
           </Routes>
