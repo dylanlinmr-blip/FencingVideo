@@ -1,10 +1,11 @@
-import { Swords, Upload, LibraryBig, Info, Users } from 'lucide-react'
+import { Swords, Upload, LibraryBig, Info, Users, CalendarDays } from 'lucide-react'
 import { NavLink } from 'react-router-dom'
 
 const links = [
   { to: '/', label: 'Bouts', icon: LibraryBig },
   { to: '/upload', label: 'Upload', icon: Upload },
   { to: '/fencers', label: 'Fencers', icon: Users },
+  { to: '/calendar', label: 'Calendar', icon: CalendarDays },
   { to: '/about', label: 'About', icon: Info },
 ]
 
