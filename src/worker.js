@@ -92,6 +92,40 @@ async function ensureSchema(env) {
     )`
   ).run()
 
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )`
+  ).run()
+
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      token TEXT NOT NULL UNIQUE,
+      expires_at TEXT NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )`
+  ).run()
+
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS bout_shares (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      bout_id INTEGER NOT NULL,
+      owner_user_id INTEGER NOT NULL,
+      target_user_id INTEGER NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (bout_id) REFERENCES bouts(id) ON DELETE CASCADE,
+      FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (target_user_id) REFERENCES users(id) ON DELETE CASCADE,
+      UNIQUE (bout_id, target_user_id)
+    )`
+  ).run()
+
   await ensureColumn(env, 'bouts', 'owner_key', "owner_key TEXT NOT NULL DEFAULT 'global'")
   await ensureColumn(env, 'fencers', 'owner_key', "owner_key TEXT NOT NULL DEFAULT 'global'")
   await ensureColumn(env, 'fencers', 'scoped_name', 'scoped_name TEXT')
@@ -106,6 +140,9 @@ async function ensureSchema(env) {
   await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_touches_bout_time ON touches(bout_id, video_time_seconds)').run()
   await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_tip_marks_bout_time ON tip_marks(bout_id, video_time_seconds)').run()
   await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_usafencing_results_fencer ON usafencing_results(fencer_id, event_date)').run()
+  await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token)').run()
+  await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_sessions_user_expires ON sessions(user_id, expires_at)').run()
+  await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_bout_shares_target ON bout_shares(target_user_id, bout_id)').run()
 }
 
 async function recalculateBoutScore(env, boutId) {
@@ -151,7 +188,34 @@ async function ensureColumn(env, table, columnName, columnDefinition) {
   }
 }
 
-function getOwnerKey(c) {
+async function sha256Hex(input) {
+  const bytes = new TextEncoder().encode(String(input))
+  const digest = await crypto.subtle.digest('SHA-256', bytes)
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+function normalizeEmail(email) {
+  return String(email || '').trim().toLowerCase()
+}
+
+async function hashPassword(password) {
+  const salt = crypto.randomUUID().replace(/-/g, '')
+  const hash = await sha256Hex(`${salt}:${String(password)}`)
+  return `${salt}:${hash}`
+}
+
+async function verifyPassword(password, storedHash) {
+  const [salt, expectedHash] = String(storedHash || '').split(':')
+  if (!salt || !expectedHash) return false
+  const actualHash = await sha256Hex(`${salt}:${String(password)}`)
+  return actualHash === expectedHash
+}
+
+function makeSessionToken() {
+  return `${crypto.randomUUID()}${crypto.randomUUID().replace(/-/g, '')}`
+}
+
+async function getAuthContext(c) {
   const fromHeader =
     c.req.header('x-user-id') ||
     c.req.header('x-genspark-user-id') ||
@@ -159,7 +223,34 @@ function getOwnerKey(c) {
     c.req.header('cf-access-authenticated-user-email')
 
   if (fromHeader) {
-    return String(fromHeader).trim().toLowerCase()
+    return {
+      ownerKey: String(fromHeader).trim().toLowerCase(),
+      user: null,
+    }
+  }
+
+  const sessionToken = getCookie(c, 'fv_session')
+  if (sessionToken) {
+    const session = await c.env.DB.prepare(
+      `SELECT s.id, s.user_id, u.email
+       FROM sessions s
+       JOIN users u ON u.id = s.user_id
+       WHERE s.token = ? AND datetime(s.expires_at) > datetime('now')
+       LIMIT 1`
+    )
+      .bind(String(sessionToken))
+      .first()
+
+    if (session) {
+      return {
+        ownerKey: `user:${session.user_id}`,
+        user: {
+          id: session.user_id,
+          email: session.email,
+        },
+        sessionToken: String(sessionToken),
+      }
+    }
   }
 
   let cookieValue = getCookie(c, 'fv_owner_key')
@@ -174,7 +265,10 @@ function getOwnerKey(c) {
     })
   }
 
-  return String(cookieValue).trim().toLowerCase()
+  return {
+    ownerKey: String(cookieValue).trim().toLowerCase(),
+    user: null,
+  }
 }
 
 async function upsertFencer(env, ownerKey, rawName) {
@@ -443,14 +537,146 @@ async function buildFencerScoutingReport(env, ownerKey, fencerName) {
   return report
 }
 
+async function getAccessibleBout(env, boutId, ownerKey, userId) {
+  return env.DB.prepare(
+    `SELECT b.*,
+            CASE WHEN b.owner_key = ? THEN 1 ELSE 0 END AS can_edit,
+            CASE WHEN b.owner_key = ? THEN 'owned' ELSE 'shared' END AS access_type,
+            owner_user.email AS owner_email
+     FROM bouts b
+     LEFT JOIN bout_shares bs ON bs.bout_id = b.id AND bs.target_user_id = ?
+     LEFT JOIN users owner_user ON owner_user.id = bs.owner_user_id
+     WHERE b.id = ? AND (b.owner_key = ? OR bs.id IS NOT NULL)
+     LIMIT 1`
+  )
+    .bind(ownerKey, ownerKey, Number(userId) || -1, boutId, ownerKey)
+    .first()
+}
+
 app.get('/api/health', (c) => c.json({ ok: true }))
+
+app.get('/api/auth/me', async (c) => {
+  await ensureSchema(c.env)
+  const { user } = await getAuthContext(c)
+  return c.json({
+    user: user ? { id: user.id, email: user.email } : null,
+  })
+})
+
+app.post('/api/auth/signup', async (c) => {
+  await ensureSchema(c.env)
+  const { email, password } = await c.req.json()
+  const normalizedEmail = normalizeEmail(email)
+
+  if (!normalizedEmail || !normalizedEmail.includes('@')) {
+    return c.json({ error: 'Valid email is required' }, 400)
+  }
+
+  if (!password || String(password).length < 8) {
+    return c.json({ error: 'Password must be at least 8 characters' }, 400)
+  }
+
+  const passwordHash = await hashPassword(password)
+
+  try {
+    await c.env.DB.prepare('INSERT INTO users (email, password_hash) VALUES (?, ?)')
+      .bind(normalizedEmail, passwordHash)
+      .run()
+  } catch {
+    return c.json({ error: 'An account with this email already exists' }, 409)
+  }
+
+  const user = await c.env.DB.prepare('SELECT id, email FROM users WHERE email = ?').bind(normalizedEmail).first()
+  const token = makeSessionToken()
+  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()
+
+  await c.env.DB.prepare('INSERT INTO sessions (user_id, token, expires_at) VALUES (?, ?, ?)')
+    .bind(user.id, token, expiresAt)
+    .run()
+
+  setCookie(c, 'fv_session', token, {
+    path: '/',
+    httpOnly: true,
+    sameSite: 'Lax',
+    secure: true,
+    maxAge: 60 * 60 * 24 * 30,
+  })
+
+  return c.json({ user: { id: user.id, email: user.email } }, 201)
+})
+
+app.post('/api/auth/login', async (c) => {
+  await ensureSchema(c.env)
+  const { email, password } = await c.req.json()
+  const normalizedEmail = normalizeEmail(email)
+
+  if (!normalizedEmail || !password) {
+    return c.json({ error: 'Email and password are required' }, 400)
+  }
+
+  const user = await c.env.DB.prepare('SELECT id, email, password_hash FROM users WHERE email = ?')
+    .bind(normalizedEmail)
+    .first()
+
+  if (!user) return c.json({ error: 'Invalid email or password' }, 401)
+
+  const valid = await verifyPassword(password, user.password_hash)
+  if (!valid) return c.json({ error: 'Invalid email or password' }, 401)
+
+  const token = makeSessionToken()
+  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()
+  await c.env.DB.prepare('INSERT INTO sessions (user_id, token, expires_at) VALUES (?, ?, ?)')
+    .bind(user.id, token, expiresAt)
+    .run()
+
+  setCookie(c, 'fv_session', token, {
+    path: '/',
+    httpOnly: true,
+    sameSite: 'Lax',
+    secure: true,
+    maxAge: 60 * 60 * 24 * 30,
+  })
+
+  return c.json({ user: { id: user.id, email: user.email } })
+})
+
+app.post('/api/auth/logout', async (c) => {
+  await ensureSchema(c.env)
+  const token = getCookie(c, 'fv_session')
+  if (token) {
+    await c.env.DB.prepare('DELETE FROM sessions WHERE token = ?').bind(String(token)).run()
+  }
+
+  setCookie(c, 'fv_session', '', {
+    path: '/',
+    httpOnly: true,
+    sameSite: 'Lax',
+    secure: true,
+    maxAge: 0,
+  })
+
+  return c.json({ success: true })
+})
 
 app.get('/api/bouts', async (c) => {
   await ensureSchema(c.env)
-  const ownerKey = getOwnerKey(c)
-  const { results } = await c.env.DB.prepare('SELECT * FROM bouts WHERE owner_key = ? ORDER BY datetime(created_at) DESC, id DESC')
-    .bind(ownerKey)
+  const { ownerKey, user } = await getAuthContext(c)
+  const userId = user?.id || -1
+
+  const { results } = await c.env.DB.prepare(
+    `SELECT b.*, 
+            CASE WHEN b.owner_key = ? THEN 1 ELSE 0 END AS can_edit,
+            CASE WHEN b.owner_key = ? THEN 'owned' ELSE 'shared' END AS access_type,
+            owner_user.email AS shared_by_email
+     FROM bouts b
+     LEFT JOIN bout_shares bs ON bs.bout_id = b.id AND bs.target_user_id = ?
+     LEFT JOIN users owner_user ON owner_user.id = bs.owner_user_id
+     WHERE b.owner_key = ? OR bs.id IS NOT NULL
+     ORDER BY datetime(b.created_at) DESC, b.id DESC`
+  )
+    .bind(ownerKey, ownerKey, userId, ownerKey)
     .all()
+
   return c.json(results.map((b) => ({ ...b, video_url: `/uploads/${b.video_filename}` })))
 })
 
@@ -536,13 +762,13 @@ async function getFencerSummaries(env, ownerKey) {
 
 app.get('/api/fencers', async (c) => {
   await ensureSchema(c.env)
-  const ownerKey = getOwnerKey(c)
+  const { ownerKey, user } = await getAuthContext(c)
   return c.json(await getFencerSummaries(c.env, ownerKey))
 })
 
 app.get('/api/fencers/:name', async (c) => {
   await ensureSchema(c.env)
-  const ownerKey = getOwnerKey(c)
+  const { ownerKey, user } = await getAuthContext(c)
   const name = decodeURIComponent(c.req.param('name'))
   const fencers = await getFencerSummaries(c.env, ownerKey)
   const fencer = fencers.find((entry) => entry.name === name)
@@ -552,7 +778,7 @@ app.get('/api/fencers/:name', async (c) => {
 
 app.get('/api/fencers/:name/scouting-report', async (c) => {
   await ensureSchema(c.env)
-  const ownerKey = getOwnerKey(c)
+  const { ownerKey, user } = await getAuthContext(c)
   const name = decodeURIComponent(c.req.param('name'))
   const report = await buildFencerScoutingReport(c.env, ownerKey, name)
   if (!report) return c.json({ error: 'Fencer not found' }, 404)
@@ -561,7 +787,7 @@ app.get('/api/fencers/:name/scouting-report', async (c) => {
 
 app.post('/api/fencers/:name/usafencing-link', async (c) => {
   await ensureSchema(c.env)
-  const ownerKey = getOwnerKey(c)
+  const { ownerKey, user } = await getAuthContext(c)
   const name = decodeURIComponent(c.req.param('name'))
   const { member_id, profile_url } = await c.req.json()
 
@@ -578,7 +804,7 @@ app.post('/api/fencers/:name/usafencing-link', async (c) => {
 
 app.post('/api/fencers/:name/usafencing-sync', async (c) => {
   await ensureSchema(c.env)
-  const ownerKey = getOwnerKey(c)
+  const { ownerKey, user } = await getAuthContext(c)
   const name = decodeURIComponent(c.req.param('name'))
 
   const scopedName = `${ownerKey}::${String(name).trim().toLowerCase()}`
@@ -613,7 +839,7 @@ app.post('/api/fencers/:name/usafencing-sync', async (c) => {
 
 app.get('/api/calendar/blocks', async (c) => {
   await ensureSchema(c.env)
-  const ownerKey = getOwnerKey(c)
+  const { ownerKey, user } = await getAuthContext(c)
   const { results } = await c.env.DB.prepare('SELECT * FROM calendar_blocks WHERE owner_key = ? ORDER BY datetime(start_time) ASC, id ASC')
     .bind(ownerKey)
     .all()
@@ -622,7 +848,7 @@ app.get('/api/calendar/blocks', async (c) => {
 
 app.post('/api/calendar/blocks', async (c) => {
   await ensureSchema(c.env)
-  const ownerKey = getOwnerKey(c)
+  const { ownerKey, user } = await getAuthContext(c)
   const { title, start_time, end_time, location, notes } = await c.req.json()
 
   if (!title || !start_time || !end_time) {
@@ -641,7 +867,7 @@ app.post('/api/calendar/blocks', async (c) => {
 
 app.delete('/api/calendar/blocks/:id', async (c) => {
   await ensureSchema(c.env)
-  const ownerKey = getOwnerKey(c)
+  const { ownerKey, user } = await getAuthContext(c)
   const id = Number(c.req.param('id'))
   await c.env.DB.prepare('DELETE FROM calendar_blocks WHERE id = ? AND owner_key = ?').bind(id, ownerKey).run()
   return c.json({ success: true })
@@ -666,7 +892,7 @@ app.get('/api/usafencing/events', async (c) => {
 
 app.post('/api/bouts', async (c) => {
   await ensureSchema(c.env)
-  const ownerKey = getOwnerKey(c)
+  const { ownerKey, user } = await getAuthContext(c)
   const form = await c.req.formData()
   const file = form.get('video')
   const title = form.get('title')
@@ -704,7 +930,7 @@ app.post('/api/bouts', async (c) => {
 
 app.post('/api/uploads/init', async (c) => {
   await ensureSchema(c.env)
-  getOwnerKey(c)
+  await getAuthContext(c)
 
   const { filename, contentType } = await c.req.json()
   if (!filename) {
@@ -749,7 +975,7 @@ app.put('/api/uploads/part', async (c) => {
 
 app.post('/api/uploads/complete', async (c) => {
   await ensureSchema(c.env)
-  const ownerKey = getOwnerKey(c)
+  const { ownerKey, user } = await getAuthContext(c)
 
   const { key, uploadId, parts, title, weapon, left_name, right_name } = await c.req.json()
 
@@ -799,10 +1025,10 @@ app.post('/api/uploads/abort', async (c) => {
 
 app.get('/api/bouts/:id', async (c) => {
   await ensureSchema(c.env)
-  const ownerKey = getOwnerKey(c)
+  const { ownerKey, user } = await getAuthContext(c)
   const id = Number(c.req.param('id'))
 
-  const bout = await c.env.DB.prepare('SELECT * FROM bouts WHERE id = ? AND owner_key = ?').bind(id, ownerKey).first()
+  const bout = await getAccessibleBout(c.env, id, ownerKey, user?.id)
   if (!bout) return c.json({ error: 'Bout not found' }, 404)
 
   const touches = await c.env.DB.prepare(
@@ -827,7 +1053,7 @@ app.get('/api/bouts/:id', async (c) => {
 
 app.delete('/api/bouts/:id', async (c) => {
   await ensureSchema(c.env)
-  const ownerKey = getOwnerKey(c)
+  const { ownerKey } = await getAuthContext(c)
   const id = Number(c.req.param('id'))
 
   const bout = await c.env.DB.prepare('SELECT * FROM bouts WHERE id = ? AND owner_key = ?').bind(id, ownerKey).first()
@@ -839,9 +1065,86 @@ app.delete('/api/bouts/:id', async (c) => {
   return c.json({ success: true })
 })
 
+app.get('/api/bouts/:id/shares', async (c) => {
+  await ensureSchema(c.env)
+  const { ownerKey, user } = await getAuthContext(c)
+  const boutId = Number(c.req.param('id'))
+
+  if (!user) return c.json({ error: 'Sign in required' }, 401)
+
+  const bout = await c.env.DB.prepare('SELECT id FROM bouts WHERE id = ? AND owner_key = ?')
+    .bind(boutId, ownerKey)
+    .first()
+  if (!bout) return c.json({ error: 'Bout not found' }, 404)
+
+  const { results } = await c.env.DB.prepare(
+    `SELECT bs.id, bs.created_at, bs.target_user_id, u.email
+     FROM bout_shares bs
+     JOIN users u ON u.id = bs.target_user_id
+     WHERE bs.bout_id = ?
+     ORDER BY datetime(bs.created_at) DESC, bs.id DESC`
+  )
+    .bind(boutId)
+    .all()
+
+  return c.json(results)
+})
+
+app.post('/api/bouts/:id/share', async (c) => {
+  await ensureSchema(c.env)
+  const { ownerKey, user } = await getAuthContext(c)
+  const boutId = Number(c.req.param('id'))
+  const { email } = await c.req.json()
+  const normalizedEmail = normalizeEmail(email)
+
+  if (!user) return c.json({ error: 'Sign in required' }, 401)
+  if (!normalizedEmail || !normalizedEmail.includes('@')) {
+    return c.json({ error: 'Valid email is required' }, 400)
+  }
+
+  const bout = await c.env.DB.prepare('SELECT id FROM bouts WHERE id = ? AND owner_key = ?')
+    .bind(boutId, ownerKey)
+    .first()
+  if (!bout) return c.json({ error: 'Bout not found' }, 404)
+
+  const target = await c.env.DB.prepare('SELECT id, email FROM users WHERE email = ?')
+    .bind(normalizedEmail)
+    .first()
+  if (!target) return c.json({ error: 'No account found for that email address' }, 404)
+  if (Number(target.id) === Number(user.id)) {
+    return c.json({ error: 'You already own this bout' }, 400)
+  }
+
+  await c.env.DB.prepare('INSERT INTO bout_shares (bout_id, owner_user_id, target_user_id) VALUES (?, ?, ?) ON CONFLICT(bout_id, target_user_id) DO NOTHING')
+    .bind(boutId, user.id, target.id)
+    .run()
+
+  return c.json({ success: true, shared_with: target.email })
+})
+
+app.delete('/api/bouts/:id/shares/:shareId', async (c) => {
+  await ensureSchema(c.env)
+  const { ownerKey, user } = await getAuthContext(c)
+  const boutId = Number(c.req.param('id'))
+  const shareId = Number(c.req.param('shareId'))
+
+  if (!user) return c.json({ error: 'Sign in required' }, 401)
+
+  const bout = await c.env.DB.prepare('SELECT id FROM bouts WHERE id = ? AND owner_key = ?')
+    .bind(boutId, ownerKey)
+    .first()
+  if (!bout) return c.json({ error: 'Bout not found' }, 404)
+
+  await c.env.DB.prepare('DELETE FROM bout_shares WHERE id = ? AND bout_id = ?')
+    .bind(shareId, boutId)
+    .run()
+
+  return c.json({ success: true })
+})
+
 app.post('/api/bouts/:id/touches', async (c) => {
   await ensureSchema(c.env)
-  const ownerKey = getOwnerKey(c)
+  const { ownerKey, user } = await getAuthContext(c)
   const boutId = Number(c.req.param('id'))
   const { video_time_seconds, scorer, row_verdict, note } = await c.req.json()
 
@@ -865,7 +1168,7 @@ app.post('/api/bouts/:id/touches', async (c) => {
 
 app.delete('/api/touches/:id', async (c) => {
   await ensureSchema(c.env)
-  const ownerKey = getOwnerKey(c)
+  const { ownerKey, user } = await getAuthContext(c)
   const touchId = Number(c.req.param('id'))
 
   const touch = await c.env.DB.prepare(
@@ -885,7 +1188,7 @@ app.delete('/api/touches/:id', async (c) => {
 
 app.post('/api/bouts/:id/tip-marks', async (c) => {
   await ensureSchema(c.env)
-  const ownerKey = getOwnerKey(c)
+  const { ownerKey, user } = await getAuthContext(c)
   const boutId = Number(c.req.param('id'))
   const { marks } = await c.req.json()
 
@@ -915,7 +1218,7 @@ app.post('/api/bouts/:id/tip-marks', async (c) => {
 
 app.delete('/api/bouts/:id/tip-marks', async (c) => {
   await ensureSchema(c.env)
-  const ownerKey = getOwnerKey(c)
+  const { ownerKey, user } = await getAuthContext(c)
   const boutId = Number(c.req.param('id'))
   const fencer = c.req.query('fencer')
 
@@ -939,13 +1242,20 @@ app.delete('/api/bouts/:id/tip-marks', async (c) => {
 
 app.get('/uploads/:filename', async (c) => {
   await ensureSchema(c.env)
-  const ownerKey = getOwnerKey(c)
+  const { ownerKey, user } = await getAuthContext(c)
   const key = c.req.param('filename')
 
-  const ownsVideo = await c.env.DB.prepare('SELECT id FROM bouts WHERE video_filename = ? AND owner_key = ? LIMIT 1')
-    .bind(key, ownerKey)
+  const access = await c.env.DB.prepare(
+    `SELECT b.id
+     FROM bouts b
+     LEFT JOIN bout_shares bs ON bs.bout_id = b.id AND bs.target_user_id = ?
+     WHERE b.video_filename = ? AND (b.owner_key = ? OR bs.id IS NOT NULL)
+     LIMIT 1`
+  )
+    .bind(user?.id || -1, key, ownerKey)
     .first()
-  if (!ownsVideo) return c.notFound()
+
+  if (!access) return c.notFound()
 
   const object = await c.env.VIDEOS.get(key)
   if (!object) return c.notFound()
