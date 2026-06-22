@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { ArrowRight, ExternalLink, RefreshCw, Save, Search, UserRound } from 'lucide-react'
+import { ArrowRight, Brain, ExternalLink, RefreshCw, Save, Search, UserRound } from 'lucide-react'
 import { api } from '../lib/api'
 
 function formatDate(value) {
@@ -17,7 +17,10 @@ export default function FencersPage() {
   const [message, setMessage] = useState('')
   const [savingName, setSavingName] = useState('')
   const [syncingName, setSyncingName] = useState('')
+  const [scoutingLoadingName, setScoutingLoadingName] = useState('')
+  const [analyzingVisible, setAnalyzingVisible] = useState(false)
   const [linkDrafts, setLinkDrafts] = useState({})
+  const [scoutingReports, setScoutingReports] = useState({})
 
   const loadFencers = async () => {
     setLoading(true)
@@ -101,6 +104,39 @@ export default function FencersPage() {
     }
   }
 
+  const analyzeFencer = async (name) => {
+    setScoutingLoadingName(name)
+    setMessage('')
+    try {
+      const report = await api(`/api/fencers/${encodeURIComponent(name)}/scouting-report`)
+      setScoutingReports((prev) => ({ ...prev, [name]: report }))
+    } catch (error) {
+      setMessage(`AI analysis failed for ${name}: ${error.message}`)
+    } finally {
+      setScoutingLoadingName('')
+    }
+  }
+
+  const analyzeVisibleFencers = async () => {
+    if (analyzingVisible) return
+    setAnalyzingVisible(true)
+    setMessage('')
+
+    try {
+      for (const fencer of filtered) {
+        if (scoutingReports[fencer.name]) continue
+        const report = await api(`/api/fencers/${encodeURIComponent(fencer.name)}/scouting-report`)
+        setScoutingReports((prev) => ({ ...prev, [fencer.name]: report }))
+      }
+      setMessage(`AI scouting complete for ${filtered.length} visible fencer(s).`)
+    } catch (error) {
+      setMessage(error.message)
+    } finally {
+      setAnalyzingVisible(false)
+      setScoutingLoadingName('')
+    }
+  }
+
   if (loading) return <div className="text-slate-400">Loading fencers...</div>
 
   return (
@@ -110,15 +146,20 @@ export default function FencersPage() {
           <h1 className="text-2xl font-bold">Fencer Tracker</h1>
           <p className="text-slate-400 text-sm">Every fencer from the left/right side of uploaded bouts, plus their complete bout history.</p>
         </div>
-        <label className="glass px-3 py-2 flex items-center gap-2 text-sm">
-          <Search size={16} className="text-slate-400" />
-          <input
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="Search fencer"
-            className="bg-transparent outline-none text-slate-100 placeholder:text-slate-500"
-          />
-        </label>
+        <div className="flex flex-wrap gap-2 items-center">
+          <label className="glass px-3 py-2 flex items-center gap-2 text-sm">
+            <Search size={16} className="text-slate-400" />
+            <input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Search fencer"
+              className="bg-transparent outline-none text-slate-100 placeholder:text-slate-500"
+            />
+          </label>
+          <button className="btn-primary text-xs" onClick={analyzeVisibleFencers} disabled={analyzingVisible || filtered.length === 0}>
+            <Brain size={14} /> {analyzingVisible ? 'Analyzing...' : 'Analyze Visible Strengths/Weaknesses'}
+          </button>
+        </div>
       </div>
 
       {message ? <div className="glass p-3 text-sm text-slate-300">{message}</div> : null}
@@ -129,6 +170,9 @@ export default function FencersPage() {
         <div className="space-y-4">
           {filtered.map((fencer) => {
             const draft = linkDrafts[fencer.name] || { member_id: '', profile_url: '' }
+            const report = scoutingReports[fencer.name]
+            const isAnalyzingThis = scoutingLoadingName === fencer.name
+
             return (
               <article key={fencer.name} className="glass p-4 space-y-4">
                 <header className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
@@ -142,6 +186,9 @@ export default function FencersPage() {
                     </p>
                   </div>
                   <div className="flex flex-wrap gap-2">
+                    <button className="btn-ghost text-xs" onClick={() => analyzeFencer(fencer.name)} disabled={isAnalyzingThis || analyzingVisible}>
+                      <Brain size={14} /> {isAnalyzingThis ? 'Analyzing...' : 'AI Strengths/Weaknesses'}
+                    </button>
                     <Link className="btn-ghost text-xs" to={`/fencers/${encodeURIComponent(fencer.name)}`}>
                       View Detail <ArrowRight size={14} />
                     </Link>
@@ -184,6 +231,37 @@ export default function FencersPage() {
                   </div>
 
                   <div className="space-y-3">
+                    <div className="space-y-2">
+                      <h3 className="font-medium flex items-center gap-2">
+                        <Brain size={16} className="text-accentRed" />
+                        AI Strengths & Weaknesses
+                      </h3>
+                      {report ? (
+                        <div className="space-y-3 bg-slate-900/40 rounded-lg p-3 text-sm">
+                          <p className="text-slate-300">{report.ai_summary}</p>
+                          <p className="text-xs text-slate-500">Confidence: {report.confidence || 'low'}</p>
+                          <div>
+                            <h4 className="text-xs uppercase tracking-wide text-emerald-300 mb-1">Strengths</h4>
+                            <ul className="list-disc pl-5 space-y-1 text-slate-200">
+                              {(report.strengths || []).map((item) => (
+                                <li key={`${fencer.name}-strength-${item}`}>{item}</li>
+                              ))}
+                            </ul>
+                          </div>
+                          <div>
+                            <h4 className="text-xs uppercase tracking-wide text-amber-300 mb-1">Weaknesses</h4>
+                            <ul className="list-disc pl-5 space-y-1 text-slate-200">
+                              {(report.weaknesses || []).map((item) => (
+                                <li key={`${fencer.name}-weakness-${item}`}>{item}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        </div>
+                      ) : (
+                        <p className="text-sm text-slate-400">Run AI analysis to generate a quick strengths/weaknesses profile.</p>
+                      )}
+                    </div>
+
                     <h3 className="font-medium">USA Fencing Link</h3>
                     <div className="space-y-2">
                       <input
