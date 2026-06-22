@@ -392,6 +392,55 @@ function buildScoutingRecommendations(report) {
   }
 }
 
+function buildStrengthsWeaknesses(report) {
+  const strengths = []
+  const weaknesses = []
+
+  const topStyle = report.row_style_breakdown?.[0]
+  if (report.win_rate >= 0.6 && report.total_bouts >= 3) {
+    strengths.push(`Strong match conversion: ${Math.round(report.win_rate * 100)}% win rate over ${report.total_bouts} bouts.`)
+  }
+
+  if (report.opening_touch_rate >= 0.6) {
+    strengths.push(`Fast starter: wins the opening touch in ${Math.round(report.opening_touch_rate * 100)}% of bouts.`)
+  } else if (report.opening_touch_rate <= 0.35 && report.total_bouts > 0) {
+    weaknesses.push('Often starts slowly and loses the opening touch exchange.')
+  }
+
+  const diff = (report.average_scored_per_bout || 0) - (report.average_conceded_per_bout || 0)
+  if (diff >= 1.5) {
+    strengths.push(`Positive scoring margin: +${diff.toFixed(2)} average touch differential per bout.`)
+  } else if (diff <= -1) {
+    weaknesses.push(`Negative scoring margin: ${diff.toFixed(2)} average touch differential per bout.`)
+  }
+
+  if (topStyle && topStyle.style !== 'Other' && topStyle.share >= 0.35) {
+    strengths.push(`Primary scoring pattern is ${topStyle.style} (${Math.round((topStyle.share || 0) * 100)}% of scoring touches).`)
+  }
+
+  if (topStyle && topStyle.share >= 0.5) {
+    weaknesses.push(`Scoring style can become predictable (${topStyle.style} appears in ${Math.round((topStyle.share || 0) * 100)}% of touches).`)
+  }
+
+  if (report.tempo_seconds_per_scoring_touch && report.tempo_seconds_per_scoring_touch < 14) {
+    strengths.push('High-tempo scorer when actions accelerate between halts.')
+  } else if (report.tempo_seconds_per_scoring_touch && report.tempo_seconds_per_scoring_touch > 28) {
+    weaknesses.push('Can struggle to finish actions quickly in high-tempo exchanges.')
+  }
+
+  if (report.total_bouts < 3 || report.total_touches_scored < 12) {
+    weaknesses.push('Limited tracked data; conclusions have low confidence.')
+  }
+
+  if (strengths.length === 0) strengths.push('Balanced profile with no standout strength signal yet.')
+  if (weaknesses.length === 0) weaknesses.push('No clear weakness signal yet from tracked bouts.')
+
+  return {
+    strengths: strengths.slice(0, 4),
+    weaknesses: weaknesses.slice(0, 4),
+  }
+}
+
 async function buildFencerScoutingReport(env, ownerKey, fencerName) {
   const name = String(fencerName || '').trim()
   if (!name) return null
@@ -422,6 +471,8 @@ async function buildFencerScoutingReport(env, ownerKey, fencerName) {
       opponent_breakdown: [],
       ai_summary: 'No bout data yet for this fencer.',
       how_to_fence_them: ['Record at least one analyzed bout with touches to generate scouting recommendations.'],
+      strengths: ['No data yet — upload and annotate bouts to reveal strengths.'],
+      weaknesses: ['No data yet — upload and annotate bouts to reveal weaknesses.'],
       confidence: 'low',
     }
   }
@@ -533,6 +584,10 @@ async function buildFencerScoutingReport(env, ownerKey, fencerName) {
   report.ai_summary = `${name} has a ${Math.round(report.win_rate * 100)}% win rate across ${report.total_bouts} bout(s), averaging ${report.average_scored_per_bout} scored vs ${report.average_conceded_per_bout} conceded touches.`
   report.style_signals = insights.style_signals
   report.how_to_fence_them = insights.recommendations
+
+  const profile = buildStrengthsWeaknesses(report)
+  report.strengths = profile.strengths
+  report.weaknesses = profile.weaknesses
 
   return report
 }
