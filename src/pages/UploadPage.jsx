@@ -3,7 +3,36 @@ import { useNavigate } from 'react-router-dom'
 import { UploadCloud } from 'lucide-react'
 import { api } from '../lib/api'
 
+const MAX_PART_BYTES = 25 * 1024 * 1024
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+function getUploadPlan(fileSize) {
+  const cores = typeof navigator !== 'undefined' ? navigator.hardwareConcurrency || 4 : 4
+  const hardwareLimit = Math.max(2, Math.min(8, Number(cores)))
+
+  let chunkSize = 8 * 1024 * 1024
+  let concurrency = Math.min(4, hardwareLimit)
+
+  if (fileSize <= 80 * 1024 * 1024) {
+    chunkSize = 5 * 1024 * 1024
+    concurrency = Math.min(3, hardwareLimit)
+  } else if (fileSize <= 400 * 1024 * 1024) {
+    chunkSize = 10 * 1024 * 1024
+    concurrency = Math.min(4, hardwareLimit)
+  } else if (fileSize <= 1024 * 1024 * 1024) {
+    chunkSize = 16 * 1024 * 1024
+    concurrency = Math.min(5, hardwareLimit)
+  } else {
+    chunkSize = 20 * 1024 * 1024
+    concurrency = Math.min(6, hardwareLimit)
+  }
+
+  return {
+    chunkSize: Math.min(chunkSize, MAX_PART_BYTES),
+    concurrency,
+  }
+}
 
 export default function UploadPage() {
   const navigate = useNavigate()
@@ -12,6 +41,7 @@ export default function UploadPage() {
   const [dragging, setDragging] = useState(false)
   const [saving, setSaving] = useState(false)
   const [uploadProgress, setUploadProgress] = useState(0)
+  const [uploadMeta, setUploadMeta] = useState({ streams: 0, chunkSizeMb: 0, uploadedMb: 0, totalMb: 0 })
   const [error, setError] = useState('')
   const [form, setForm] = useState({
     title: '',
@@ -20,7 +50,7 @@ export default function UploadPage() {
     right_name: 'Right Fencer',
   })
 
-  const uploadPartWithRetry = async ({ key, uploadId, partNumber, chunk, maxRetries = 3 }) => {
+  const uploadPartWithRetry = async ({ key, uploadId, partNumber, chunk, maxRetries = 4 }) => {
     let lastError = null
 
     for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
@@ -36,7 +66,8 @@ export default function UploadPage() {
       } catch (err) {
         lastError = err
         if (attempt < maxRetries) {
-          await sleep(500 * attempt)
+          const backoff = 400 * 2 ** (attempt - 1) + Math.floor(Math.random() * 250)
+          await sleep(backoff)
         }
       }
     }
@@ -48,11 +79,17 @@ export default function UploadPage() {
     event.preventDefault()
     if (!file) return
 
-    const chunkSize = 5 * 1024 * 1024
+    const { chunkSize, concurrency } = getUploadPlan(file.size)
     let uploadSession = null
 
     setSaving(true)
     setUploadProgress(0)
+    setUploadMeta({
+      streams: concurrency,
+      chunkSizeMb: Math.round((chunkSize / (1024 * 1024)) * 10) / 10,
+      uploadedMb: 0,
+      totalMb: Math.round((file.size / (1024 * 1024)) * 10) / 10,
+    })
     setError('')
 
     try {
@@ -65,23 +102,43 @@ export default function UploadPage() {
       })
 
       const totalParts = Math.ceil(file.size / chunkSize)
-      const parts = []
+      const parts = new Array(totalParts)
+      let uploadedBytes = 0
+      let nextPartIndex = 0
 
-      for (let index = 0; index < totalParts; index += 1) {
-        const partNumber = index + 1
-        const start = index * chunkSize
-        const end = Math.min(start + chunkSize, file.size)
-        const chunk = file.slice(start, end)
+      const worker = async () => {
+        while (true) {
+          const currentIndex = nextPartIndex
+          nextPartIndex += 1
+          if (currentIndex >= totalParts) return
 
-        const uploadedPart = await uploadPartWithRetry({
-          key: uploadSession.key,
-          uploadId: uploadSession.uploadId,
-          partNumber,
-          chunk,
-        })
+          const partNumber = currentIndex + 1
+          const start = currentIndex * chunkSize
+          const end = Math.min(start + chunkSize, file.size)
+          const chunk = file.slice(start, end)
 
-        parts.push({ partNumber, etag: uploadedPart.etag })
-        setUploadProgress(Math.round((partNumber / totalParts) * 100))
+          const uploadedPart = await uploadPartWithRetry({
+            key: uploadSession.key,
+            uploadId: uploadSession.uploadId,
+            partNumber,
+            chunk,
+          })
+
+          parts[currentIndex] = { partNumber, etag: uploadedPart.etag }
+          uploadedBytes += chunk.size
+          setUploadProgress(Math.min(100, Math.round((uploadedBytes / file.size) * 100)))
+          setUploadMeta((prev) => ({
+            ...prev,
+            uploadedMb: Math.round((uploadedBytes / (1024 * 1024)) * 10) / 10,
+          }))
+        }
+      }
+
+      const workerCount = Math.min(concurrency, totalParts)
+      await Promise.all(Array.from({ length: workerCount }, () => worker()))
+
+      if (parts.some((part) => !part)) {
+        throw new Error('Upload incomplete. Please retry.')
       }
 
       const created = await api('/api/uploads/complete', {
@@ -109,7 +166,7 @@ export default function UploadPage() {
 
       const normalizedError = String(err?.message || '').toLowerCase()
       if (normalizedError.includes('request denied')) {
-        setError('Upload request was denied. We now upload in 5MB chunks with retries, but this still requires a working API-enabled deployment link.')
+        setError('Upload request was denied. Upload now uses adaptive chunk sizing and parallel streams, but still requires a working API-enabled deployment link.')
       } else {
         setError(err.message || 'Upload failed. Please try again.')
       }
@@ -203,7 +260,8 @@ export default function UploadPage() {
 
         {saving ? (
           <p className="text-sm text-slate-200 bg-slate-800/60 border border-slate-600 rounded p-2">
-            Uploading in chunks... {uploadProgress}%
+            Uploading with {uploadMeta.streams} parallel streams ({uploadMeta.chunkSizeMb}MB chunks): {uploadProgress}%
+            {uploadMeta.totalMb > 0 ? ` • ${uploadMeta.uploadedMb}/${uploadMeta.totalMb} MB` : ''}
           </p>
         ) : null}
 
