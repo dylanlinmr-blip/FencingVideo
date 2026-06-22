@@ -4,6 +4,7 @@ import { UploadCloud } from 'lucide-react'
 import { api } from '../lib/api'
 
 const MAX_PART_BYTES = 25 * 1024 * 1024
+const RESUME_STORAGE_KEY = 'fv_upload_resume_v1'
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -34,14 +35,62 @@ function getUploadPlan(fileSize) {
   }
 }
 
+function getFileFingerprint(file) {
+  if (!file) return ''
+  return `${file.name}::${file.size}::${file.lastModified}`
+}
+
+function readResumeState() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(RESUME_STORAGE_KEY) || 'null')
+    if (!parsed || typeof parsed !== 'object') return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+function saveResumeState(payload) {
+  localStorage.setItem(RESUME_STORAGE_KEY, JSON.stringify(payload))
+}
+
+function clearResumeState() {
+  localStorage.removeItem(RESUME_STORAGE_KEY)
+}
+
+function roundMb(bytes) {
+  return Math.round((bytes / (1024 * 1024)) * 10) / 10
+}
+
+function calculatePartBytes(partNumber, chunkSize, fileSize) {
+  const start = (partNumber - 1) * chunkSize
+  const end = Math.min(start + chunkSize, fileSize)
+  return Math.max(0, end - start)
+}
+
+function hydrateParts(totalParts, persistedParts) {
+  const parts = new Array(totalParts).fill(null)
+  for (const part of persistedParts || []) {
+    const partNumber = Number(part?.partNumber)
+    const etag = String(part?.etag || '')
+    if (!Number.isInteger(partNumber) || partNumber < 1 || partNumber > totalParts || !etag) continue
+    parts[partNumber - 1] = { partNumber, etag }
+  }
+  return parts
+}
+
 export default function UploadPage() {
   const navigate = useNavigate()
   const inputRef = useRef(null)
+  const uploadFlowRef = useRef({ paused: false, waiters: [] })
+
   const [file, setFile] = useState(null)
   const [dragging, setDragging] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [paused, setPaused] = useState(false)
   const [uploadProgress, setUploadProgress] = useState(0)
   const [uploadMeta, setUploadMeta] = useState({ streams: 0, chunkSizeMb: 0, uploadedMb: 0, totalMb: 0 })
+  const [resumeCandidate, setResumeCandidate] = useState(null)
   const [error, setError] = useState('')
   const [form, setForm] = useState({
     title: '',
@@ -50,10 +99,71 @@ export default function UploadPage() {
     right_name: 'Right Fencer',
   })
 
+  const flushResumeWaiters = () => {
+    const waiters = uploadFlowRef.current.waiters
+    uploadFlowRef.current.waiters = []
+    for (const resolve of waiters) resolve()
+  }
+
+  const pauseUpload = () => {
+    uploadFlowRef.current.paused = true
+    setPaused(true)
+  }
+
+  const resumeUpload = () => {
+    uploadFlowRef.current.paused = false
+    setPaused(false)
+    flushResumeWaiters()
+  }
+
+  const waitIfPaused = async () => {
+    if (!uploadFlowRef.current.paused) return
+    await new Promise((resolve) => {
+      uploadFlowRef.current.waiters.push(resolve)
+    })
+  }
+
+  const syncResumeCandidateForFile = (nextFile) => {
+    if (!nextFile) {
+      setResumeCandidate(null)
+      return
+    }
+
+    const saved = readResumeState()
+    if (!saved) {
+      setResumeCandidate(null)
+      return
+    }
+
+    const sameFile = saved.fileFingerprint === getFileFingerprint(nextFile)
+    if (!sameFile || !saved.key || !saved.uploadId) {
+      setResumeCandidate(null)
+      return
+    }
+
+    const totalParts = Math.ceil(nextFile.size / Number(saved.chunkSize || 1))
+    const uploadedParts = hydrateParts(totalParts, saved.parts || []).filter(Boolean).length
+
+    setResumeCandidate({
+      ...saved,
+      uploadedParts,
+      totalParts,
+    })
+
+    if (saved.form && typeof saved.form === 'object') {
+      setForm((prev) => ({
+        ...prev,
+        ...saved.form,
+      }))
+    }
+  }
+
   const uploadPartWithRetry = async ({ key, uploadId, partNumber, chunk, maxRetries = 4 }) => {
     let lastError = null
 
     for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
+      await waitIfPaused()
+
       try {
         return await api(
           `/api/uploads/part?key=${encodeURIComponent(key)}&uploadId=${encodeURIComponent(uploadId)}&partNumber=${partNumber}`,
@@ -75,42 +185,100 @@ export default function UploadPage() {
     throw new Error(lastError?.message || `Failed to upload chunk #${partNumber}`)
   }
 
-  const submit = async (event) => {
-    event.preventDefault()
-    if (!file) return
+  const persistUploadCheckpoint = ({ fileFingerprint, session, chunkSize, concurrency, parts, currentForm }) => {
+    saveResumeState({
+      fileFingerprint,
+      key: session.key,
+      uploadId: session.uploadId,
+      chunkSize,
+      concurrency,
+      parts: parts.filter(Boolean),
+      form: currentForm,
+      updatedAt: Date.now(),
+    })
+  }
 
-    const { chunkSize, concurrency } = getUploadPlan(file.size)
-    let uploadSession = null
+  const startUpload = async ({ fromSavedSession = false } = {}) => {
+    if (!file || saving) return
 
+    const fileFingerprint = getFileFingerprint(file)
+    const persisted = fromSavedSession ? readResumeState() : null
+    const canResumePersisted =
+      persisted &&
+      persisted.fileFingerprint === fileFingerprint &&
+      persisted.key &&
+      persisted.uploadId &&
+      Number.isFinite(Number(persisted.chunkSize))
+
+    const defaultPlan = getUploadPlan(file.size)
+    const chunkSize = canResumePersisted
+      ? Math.min(MAX_PART_BYTES, Math.max(5 * 1024 * 1024, Number(persisted.chunkSize)))
+      : defaultPlan.chunkSize
+    const concurrency = canResumePersisted
+      ? Math.max(2, Math.min(8, Number(persisted.concurrency || defaultPlan.concurrency)))
+      : defaultPlan.concurrency
+
+    const totalParts = Math.ceil(file.size / chunkSize)
+    const parts = hydrateParts(totalParts, canResumePersisted ? persisted.parts || [] : [])
+
+    let uploadedBytes = 0
+    for (const part of parts) {
+      if (!part) continue
+      uploadedBytes += calculatePartBytes(part.partNumber, chunkSize, file.size)
+    }
+
+    const uploadSession = canResumePersisted
+      ? { key: String(persisted.key), uploadId: String(persisted.uploadId) }
+      : await api('/api/uploads/init', {
+          method: 'POST',
+          body: JSON.stringify({
+            filename: file.name,
+            contentType: file.type || 'application/octet-stream',
+          }),
+        })
+
+    persistUploadCheckpoint({
+      fileFingerprint,
+      session: uploadSession,
+      chunkSize,
+      concurrency,
+      parts,
+      currentForm: form,
+    })
+
+    uploadFlowRef.current.paused = false
+    uploadFlowRef.current.waiters = []
+    setPaused(false)
     setSaving(true)
-    setUploadProgress(0)
+    setError('')
+    setResumeCandidate(null)
+    setUploadProgress(Math.min(100, Math.round((uploadedBytes / file.size) * 100)))
     setUploadMeta({
       streams: concurrency,
-      chunkSizeMb: Math.round((chunkSize / (1024 * 1024)) * 10) / 10,
-      uploadedMb: 0,
-      totalMb: Math.round((file.size / (1024 * 1024)) * 10) / 10,
+      chunkSizeMb: roundMb(chunkSize),
+      uploadedMb: roundMb(uploadedBytes),
+      totalMb: roundMb(file.size),
     })
-    setError('')
 
     try {
-      uploadSession = await api('/api/uploads/init', {
-        method: 'POST',
-        body: JSON.stringify({
-          filename: file.name,
-          contentType: file.type || 'application/octet-stream',
-        }),
-      })
-
-      const totalParts = Math.ceil(file.size / chunkSize)
-      const parts = new Array(totalParts)
-      let uploadedBytes = 0
       let nextPartIndex = 0
+
+      const takeNextPendingIndex = () => {
+        while (nextPartIndex < totalParts && parts[nextPartIndex]) {
+          nextPartIndex += 1
+        }
+        if (nextPartIndex >= totalParts) return -1
+        const index = nextPartIndex
+        nextPartIndex += 1
+        return index
+      }
 
       const worker = async () => {
         while (true) {
-          const currentIndex = nextPartIndex
-          nextPartIndex += 1
-          if (currentIndex >= totalParts) return
+          await waitIfPaused()
+
+          const currentIndex = takeNextPendingIndex()
+          if (currentIndex < 0) return
 
           const partNumber = currentIndex + 1
           const start = currentIndex * chunkSize
@@ -124,13 +292,25 @@ export default function UploadPage() {
             chunk,
           })
 
-          parts[currentIndex] = { partNumber, etag: uploadedPart.etag }
-          uploadedBytes += chunk.size
+          if (!parts[currentIndex]) {
+            parts[currentIndex] = { partNumber, etag: uploadedPart.etag }
+            uploadedBytes += chunk.size
+          }
+
           setUploadProgress(Math.min(100, Math.round((uploadedBytes / file.size) * 100)))
           setUploadMeta((prev) => ({
             ...prev,
-            uploadedMb: Math.round((uploadedBytes / (1024 * 1024)) * 10) / 10,
+            uploadedMb: roundMb(uploadedBytes),
           }))
+
+          persistUploadCheckpoint({
+            fileFingerprint,
+            session: uploadSession,
+            chunkSize,
+            concurrency,
+            parts,
+            currentForm: form,
+          })
         }
       }
 
@@ -138,7 +318,7 @@ export default function UploadPage() {
       await Promise.all(Array.from({ length: workerCount }, () => worker()))
 
       if (parts.some((part) => !part)) {
-        throw new Error('Upload incomplete. Please retry.')
+        throw new Error('Upload incomplete. Please resume and try again.')
       }
 
       const created = await api('/api/uploads/complete', {
@@ -151,34 +331,50 @@ export default function UploadPage() {
         }),
       })
 
+      clearResumeState()
+      setResumeCandidate(null)
       navigate(`/analyzer/${created.id}`)
     } catch (err) {
-      if (uploadSession?.key && uploadSession?.uploadId) {
-        try {
-          await api('/api/uploads/abort', {
-            method: 'POST',
-            body: JSON.stringify({ key: uploadSession.key, uploadId: uploadSession.uploadId }),
-          })
-        } catch {
-          // Ignore abort failures; surface original upload error instead.
-        }
-      }
-
       const normalizedError = String(err?.message || '').toLowerCase()
       if (normalizedError.includes('request denied')) {
-        setError('Upload request was denied. Upload now uses adaptive chunk sizing and parallel streams, but still requires a working API-enabled deployment link.')
+        setError('Upload request was denied. Please use the working API-enabled app link and resume the upload.')
       } else {
-        setError(err.message || 'Upload failed. Please try again.')
+        setError(err?.message || 'Upload interrupted. You can resume from the saved progress.')
       }
+
+      syncResumeCandidateForFile(file)
     } finally {
       setSaving(false)
+      setPaused(false)
+      uploadFlowRef.current.paused = false
+      flushResumeWaiters()
+    }
+  }
+
+  const discardSavedUpload = async () => {
+    const saved = readResumeState()
+    clearResumeState()
+    setResumeCandidate(null)
+
+    if (saved?.key && saved?.uploadId) {
+      try {
+        await api('/api/uploads/abort', {
+          method: 'POST',
+          body: JSON.stringify({ key: saved.key, uploadId: saved.uploadId }),
+        })
+      } catch {
+        // Ignore abort failures; local resume state is still cleared.
+      }
     }
   }
 
   return (
     <section className="max-w-2xl mx-auto space-y-4">
       <h1 className="text-2xl font-bold">Upload Bout</h1>
-      <form onSubmit={submit} className="glass p-5 space-y-4">
+      <form onSubmit={(event) => {
+        event.preventDefault()
+        startUpload({ fromSavedSession: false })
+      }} className="glass p-5 space-y-4">
         <button
           type="button"
           onClick={() => inputRef.current?.click()}
@@ -190,9 +386,11 @@ export default function UploadPage() {
           onDrop={(e) => {
             e.preventDefault()
             setDragging(false)
-            setFile(e.dataTransfer.files?.[0] || null)
+            const selectedFile = e.dataTransfer.files?.[0] || null
+            setFile(selectedFile)
             setUploadProgress(0)
             setError('')
+            syncResumeCandidateForFile(selectedFile)
           }}
           className={`w-full border-2 border-dashed rounded-xl p-8 text-center transition ${
             dragging ? 'border-slate-200 bg-slate-800' : 'border-slate-600'
@@ -207,11 +405,37 @@ export default function UploadPage() {
           hidden
           accept="video/mp4,video/webm,video/quicktime"
           onChange={(e) => {
-            setFile(e.target.files?.[0] || null)
+            const selectedFile = e.target.files?.[0] || null
+            setFile(selectedFile)
             setUploadProgress(0)
             setError('')
+            syncResumeCandidateForFile(selectedFile)
           }}
         />
+
+        {resumeCandidate && !saving ? (
+          <div className="text-sm text-emerald-200 bg-emerald-600/10 border border-emerald-500/40 rounded p-3 space-y-2">
+            <p>
+              Found a paused upload for this file: {resumeCandidate.uploadedParts}/{resumeCandidate.totalParts} parts complete.
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                className="btn-primary"
+                onClick={() => startUpload({ fromSavedSession: true })}
+              >
+                Resume Previous Upload
+              </button>
+              <button
+                type="button"
+                className="rounded-lg border border-slate-600 px-3 py-2 text-slate-200"
+                onClick={discardSavedUpload}
+              >
+                Discard Saved Upload
+              </button>
+            </div>
+          </div>
+        ) : null}
 
         <div className="grid gap-3 md:grid-cols-2">
           <label className="space-y-1 text-sm">
@@ -259,16 +483,37 @@ export default function UploadPage() {
         </div>
 
         {saving ? (
-          <p className="text-sm text-slate-200 bg-slate-800/60 border border-slate-600 rounded p-2">
-            Uploading with {uploadMeta.streams} parallel streams ({uploadMeta.chunkSizeMb}MB chunks): {uploadProgress}%
-            {uploadMeta.totalMb > 0 ? ` • ${uploadMeta.uploadedMb}/${uploadMeta.totalMb} MB` : ''}
-          </p>
+          <div className="text-sm text-slate-200 bg-slate-800/60 border border-slate-600 rounded p-2 space-y-2">
+            <p>
+              Uploading with {uploadMeta.streams} parallel streams ({uploadMeta.chunkSizeMb}MB chunks): {uploadProgress}%
+              {uploadMeta.totalMb > 0 ? ` • ${uploadMeta.uploadedMb}/${uploadMeta.totalMb} MB` : ''}
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {!paused ? (
+                <button
+                  type="button"
+                  className="rounded-lg border border-slate-500 px-3 py-1.5 text-slate-100"
+                  onClick={pauseUpload}
+                >
+                  Pause Upload
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="rounded-lg border border-emerald-500 px-3 py-1.5 text-emerald-200"
+                  onClick={resumeUpload}
+                >
+                  Resume Upload
+                </button>
+              )}
+            </div>
+          </div>
         ) : null}
 
         {error ? <p className="text-sm text-red-300 bg-red-500/10 border border-red-500/30 rounded p-2">{error}</p> : null}
 
         <button disabled={!file || saving} className="btn-primary disabled:opacity-50" type="submit">
-          {saving ? `Uploading ${uploadProgress}%` : 'Create Bout'}
+          {saving ? (paused ? `Paused at ${uploadProgress}%` : `Uploading ${uploadProgress}%`) : 'Create Bout'}
         </button>
       </form>
     </section>
