@@ -3,17 +3,35 @@ import { useNavigate } from 'react-router-dom'
 import { UploadCloud } from 'lucide-react'
 import { api } from '../lib/api'
 
+const MAX_PART_BYTES = 25 * 1024 * 1024
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
-function getChunkSize(fileSize) {
-  if (fileSize >= 1024 * 1024 * 1024) return 20 * 1024 * 1024
-  if (fileSize >= 300 * 1024 * 1024) return 10 * 1024 * 1024
-  return 5 * 1024 * 1024
-}
-
-function getConcurrency() {
+function getUploadPlan(fileSize) {
   const cores = typeof navigator !== 'undefined' ? navigator.hardwareConcurrency || 4 : 4
-  return Math.min(6, Math.max(2, Math.floor(cores / 2)))
+  const hardwareLimit = Math.max(2, Math.min(8, Number(cores)))
+
+  let chunkSize = 8 * 1024 * 1024
+  let concurrency = Math.min(4, hardwareLimit)
+
+  if (fileSize <= 80 * 1024 * 1024) {
+    chunkSize = 5 * 1024 * 1024
+    concurrency = Math.min(3, hardwareLimit)
+  } else if (fileSize <= 400 * 1024 * 1024) {
+    chunkSize = 10 * 1024 * 1024
+    concurrency = Math.min(4, hardwareLimit)
+  } else if (fileSize <= 1024 * 1024 * 1024) {
+    chunkSize = 16 * 1024 * 1024
+    concurrency = Math.min(5, hardwareLimit)
+  } else {
+    chunkSize = 20 * 1024 * 1024
+    concurrency = Math.min(6, hardwareLimit)
+  }
+
+  return {
+    chunkSize: Math.min(chunkSize, MAX_PART_BYTES),
+    concurrency,
+  }
 }
 
 export default function UploadPage() {
@@ -61,8 +79,7 @@ export default function UploadPage() {
     event.preventDefault()
     if (!file) return
 
-    const chunkSize = getChunkSize(file.size)
-    const concurrency = getConcurrency()
+    const { chunkSize, concurrency } = getUploadPlan(file.size)
     let uploadSession = null
 
     setSaving(true)
@@ -109,7 +126,7 @@ export default function UploadPage() {
 
           parts[currentIndex] = { partNumber, etag: uploadedPart.etag }
           uploadedBytes += chunk.size
-          setUploadProgress(Math.round((uploadedBytes / file.size) * 100))
+          setUploadProgress(Math.min(100, Math.round((uploadedBytes / file.size) * 100)))
           setUploadMeta((prev) => ({
             ...prev,
             uploadedMb: Math.round((uploadedBytes / (1024 * 1024)) * 10) / 10,
@@ -117,7 +134,12 @@ export default function UploadPage() {
         }
       }
 
-      await Promise.all(Array.from({ length: concurrency }, () => worker()))
+      const workerCount = Math.min(concurrency, totalParts)
+      await Promise.all(Array.from({ length: workerCount }, () => worker()))
+
+      if (parts.some((part) => !part)) {
+        throw new Error('Upload incomplete. Please retry.')
+      }
 
       const created = await api('/api/uploads/complete', {
         method: 'POST',
