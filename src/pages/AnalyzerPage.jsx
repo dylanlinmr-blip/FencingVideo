@@ -11,12 +11,219 @@ import {
   PenLine,
   Undo2,
   Trash2,
+  Sparkles,
+  Loader2,
+  Pencil,
+  Check,
+  X,
 } from 'lucide-react'
 import { api, formatClock } from '../lib/api'
 import { evaluateRow, rowHints } from '../lib/rowDecision'
 
 const fps = 30
 const PRE_TOUCH_OFFSET_KEY = 'fencevision.preTouchOffsetSeconds'
+
+const clamp = (value, min, max) => Math.min(max, Math.max(min, value))
+
+function averageRegionSignal(imageData, region, mode) {
+  const { data, width, height } = imageData
+  const x1 = Math.floor(clamp(region.x, 0, 1) * width)
+  const y1 = Math.floor(clamp(region.y, 0, 1) * height)
+  const x2 = Math.floor(clamp(region.x + region.w, 0, 1) * width)
+  const y2 = Math.floor(clamp(region.y + region.h, 0, 1) * height)
+
+  let count = 0
+  let sum = 0
+  const step = 2
+
+  for (let y = y1; y < y2; y += step) {
+    for (let x = x1; x < x2; x += step) {
+      const idx = (y * width + x) * 4
+      const r = data[idx]
+      const g = data[idx + 1]
+      const b = data[idx + 2]
+      const brightness = (r + g + b) / 3
+
+      if (mode === 'left') {
+        sum += r - (g + b) / 2 + brightness * 0.4
+      } else {
+        sum += g - (r + b) / 2 + brightness * 0.4
+      }
+      count += 1
+    }
+  }
+
+  return count > 0 ? sum / count : 0
+}
+
+function getMeanStd(values) {
+  if (!values.length) return { mean: 0, std: 0 }
+  const mean = values.reduce((acc, v) => acc + v, 0) / values.length
+  const variance = values.reduce((acc, v) => acc + (v - mean) ** 2, 0) / values.length
+  return { mean, std: Math.sqrt(variance) }
+}
+
+function detectSideEvents(samples, key, { threshold, std, cooldown, scorer }) {
+  const events = []
+  let inPulse = false
+  let peak = Number.NEGATIVE_INFINITY
+  let peakTime = 0
+  let lastEventTime = Number.NEGATIVE_INFINITY
+
+  for (const sample of samples) {
+    const value = sample[key]
+    const above = value > threshold
+
+    if (above) {
+      if (!inPulse) {
+        inPulse = true
+        peak = value
+        peakTime = sample.time
+      } else if (value > peak) {
+        peak = value
+        peakTime = sample.time
+      }
+    } else if (inPulse) {
+      inPulse = false
+      if (peakTime - lastEventTime >= cooldown) {
+        lastEventTime = peakTime
+        const confidence = clamp((peak - threshold) / ((std || 1) * 3), 0.1, 0.99)
+        events.push({
+          time: peakTime,
+          scorer,
+          confidence,
+          verdict: `AI DETECTED ${scorer.toUpperCase()} LIGHT`,
+          note: `AI light pulse (confidence ${(confidence * 100).toFixed(0)}%)`,
+        })
+      }
+    }
+  }
+
+  if (inPulse && peakTime - lastEventTime >= cooldown) {
+    const confidence = clamp((peak - threshold) / ((std || 1) * 3), 0.1, 0.99)
+    events.push({
+      time: peakTime,
+      scorer,
+      confidence,
+      verdict: `AI DETECTED ${scorer.toUpperCase()} LIGHT`,
+      note: `AI light pulse (confidence ${(confidence * 100).toFixed(0)}%)`,
+    })
+  }
+
+  return events
+}
+
+function mergeSimultaneousEvents(events, windowSeconds = 0.2) {
+  const sorted = [...events].sort((a, b) => a.time - b.time)
+  const merged = []
+
+  for (let i = 0; i < sorted.length; i += 1) {
+    const current = sorted[i]
+    const next = sorted[i + 1]
+
+    if (next && current.scorer !== next.scorer && Math.abs(next.time - current.time) <= windowSeconds) {
+      const confidence = Math.max(current.confidence, next.confidence)
+      merged.push({
+        time: (current.time + next.time) / 2,
+        scorer: 'none',
+        confidence,
+        verdict: 'AI DETECTED SIMULTANEOUS LIGHTS',
+        note: `AI simultaneous pulse (${(confidence * 100).toFixed(0)}%)`,
+      })
+      i += 1
+      continue
+    }
+
+    merged.push(current)
+  }
+
+  return merged.map((event, index) => ({
+    ...event,
+    id: `${Math.round(event.time * 1000)}-${index}-${Math.random().toString(36).slice(2, 7)}`,
+  }))
+}
+
+function waitForEvent(target, eventName) {
+  return new Promise((resolve, reject) => {
+    const onLoad = () => {
+      cleanup()
+      resolve()
+    }
+    const onError = () => {
+      cleanup()
+      reject(new Error(`Failed while waiting for ${eventName}`))
+    }
+    const cleanup = () => {
+      target.removeEventListener(eventName, onLoad)
+      target.removeEventListener('error', onError)
+    }
+
+    target.addEventListener(eventName, onLoad, { once: true })
+    target.addEventListener('error', onError, { once: true })
+  })
+}
+
+async function detectAiScoreTimeline({ videoUrl, leftRegion, rightRegion, sampleInterval, sensitivity, cooldown, onProgress }) {
+  const probeVideo = document.createElement('video')
+  probeVideo.src = videoUrl
+  probeVideo.muted = true
+  probeVideo.playsInline = true
+  probeVideo.preload = 'auto'
+
+  if (probeVideo.readyState < 1) {
+    await waitForEvent(probeVideo, 'loadedmetadata')
+  }
+
+  const duration = Number(probeVideo.duration) || 0
+  if (!duration) return []
+
+  const canvas = document.createElement('canvas')
+  canvas.width = 320
+  canvas.height = 180
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })
+
+  const samples = []
+  const totalSteps = Math.max(1, Math.ceil(duration / sampleInterval))
+
+  for (let stepIndex = 0; stepIndex <= totalSteps; stepIndex += 1) {
+    const time = Math.min(duration, stepIndex * sampleInterval)
+    probeVideo.currentTime = time
+    await waitForEvent(probeVideo, 'seeked')
+
+    ctx.drawImage(probeVideo, 0, 0, canvas.width, canvas.height)
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height)
+
+    samples.push({
+      time,
+      left: averageRegionSignal(imageData, leftRegion, 'left'),
+      right: averageRegionSignal(imageData, rightRegion, 'right'),
+    })
+
+    onProgress(Math.round((stepIndex / totalSteps) * 100))
+  }
+
+  const leftStats = getMeanStd(samples.map((s) => s.left))
+  const rightStats = getMeanStd(samples.map((s) => s.right))
+
+  const leftThreshold = leftStats.mean + leftStats.std * sensitivity
+  const rightThreshold = rightStats.mean + rightStats.std * sensitivity
+
+  const leftEvents = detectSideEvents(samples, 'left', {
+    threshold: leftThreshold,
+    std: leftStats.std,
+    cooldown,
+    scorer: 'left',
+  })
+
+  const rightEvents = detectSideEvents(samples, 'right', {
+    threshold: rightThreshold,
+    std: rightStats.std,
+    cooldown,
+    scorer: 'right',
+  })
+
+  return mergeSimultaneousEvents([...leftEvents, ...rightEvents])
+}
 
 export default function AnalyzerPage() {
   const { id } = useParams()
@@ -39,6 +246,27 @@ export default function AnalyzerPage() {
   const [markFencer, setMarkFencer] = useState('left')
   const [noteDraft, setNoteDraft] = useState('')
   const [touchSaving, setTouchSaving] = useState(false)
+  const [panelError, setPanelError] = useState('')
+  const [editingTouchId, setEditingTouchId] = useState(null)
+  const [editTouchDraft, setEditTouchDraft] = useState({
+    video_time_seconds: 0,
+    scorer: 'none',
+    row_verdict: '',
+    note: '',
+  })
+  const [aiScanning, setAiScanning] = useState(false)
+  const [aiProgress, setAiProgress] = useState(0)
+  const [aiApplying, setAiApplying] = useState(false)
+  const [aiPredictedTouches, setAiPredictedTouches] = useState([])
+  const [aiRegions, setAiRegions] = useState({
+    left: { x: 0.02, y: 0.02, w: 0.2, h: 0.15 },
+    right: { x: 0.78, y: 0.02, w: 0.2, h: 0.15 },
+  })
+  const [aiConfig, setAiConfig] = useState({
+    sampleInterval: 0.08,
+    sensitivity: 2.2,
+    cooldown: 0.8,
+  })
   const [answers, setAnswers] = useState({
     step1AttackEstablished: 'yes',
     step1Initiator: 'left',
@@ -203,6 +431,7 @@ export default function AnalyzerPage() {
     const touchTime = Math.max(0, awardTime - preTouchSeconds)
 
     setTouchSaving(true)
+    setPanelError('')
     try {
       const res = await api(`/api/bouts/${bout.id}/touches`, {
         method: 'POST',
@@ -241,6 +470,8 @@ export default function AnalyzerPage() {
       setBout((prev) => ({ ...prev, touches: [...prev.touches, res.touch], tip_marks: nextTipMarks }))
       setNoteDraft('')
       setActiveTab('touches')
+    } catch (err) {
+      setPanelError(err.message || 'Could not save touch')
     } finally {
       setTouchSaving(false)
     }
@@ -253,6 +484,119 @@ export default function AnalyzerPage() {
     await loadBout()
   }
 
+  const startEditTouch = (touch) => {
+    setEditingTouchId(touch.id)
+    setEditTouchDraft({
+      video_time_seconds: Number(touch.video_time_seconds) || 0,
+      scorer: touch.scorer || 'none',
+      row_verdict: touch.row_verdict || '',
+      note: touch.note || '',
+    })
+  }
+
+  const saveEditedTouch = async (touchId) => {
+    if (!bout) return
+    setTouchSaving(true)
+    setPanelError('')
+
+    try {
+      const res = await api(`/api/touches/${touchId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          video_time_seconds: Number(editTouchDraft.video_time_seconds),
+          scorer: editTouchDraft.scorer,
+          row_verdict: editTouchDraft.row_verdict,
+          note: editTouchDraft.note,
+        }),
+      })
+
+      setBout((prev) => ({
+        ...prev,
+        touches: prev.touches.map((touch) => (touch.id === touchId ? res.touch : touch)),
+      }))
+      setEditingTouchId(null)
+    } catch (err) {
+      setPanelError(err.message || 'Could not edit touch')
+    } finally {
+      setTouchSaving(false)
+    }
+  }
+
+  const deleteTouch = async (touchId) => {
+    if (!bout || touchSaving) return
+    setTouchSaving(true)
+    setPanelError('')
+    try {
+      await api(`/api/touches/${touchId}`, { method: 'DELETE' })
+      setBout((prev) => ({
+        ...prev,
+        touches: prev.touches.filter((touch) => touch.id !== touchId),
+      }))
+      if (editingTouchId === touchId) {
+        setEditingTouchId(null)
+      }
+    } catch (err) {
+      setPanelError(err.message || 'Could not delete touch')
+    } finally {
+      setTouchSaving(false)
+    }
+  }
+
+  const runAiScoreTracking = async () => {
+    if (!bout || aiScanning || aiApplying) return
+    setPanelError('')
+    setAiScanning(true)
+    setAiProgress(0)
+
+    try {
+      const predictions = await detectAiScoreTimeline({
+        videoUrl: bout.video_url,
+        leftRegion: aiRegions.left,
+        rightRegion: aiRegions.right,
+        sampleInterval: Number(aiConfig.sampleInterval),
+        sensitivity: Number(aiConfig.sensitivity),
+        cooldown: Number(aiConfig.cooldown),
+        onProgress: setAiProgress,
+      })
+      setAiPredictedTouches(predictions)
+      setActiveTab('ai')
+    } catch (err) {
+      setPanelError(err.message || 'AI score tracking failed. Try adjusting the light regions and rerun.')
+    } finally {
+      setAiScanning(false)
+      setAiProgress(100)
+    }
+  }
+
+  const applyAiTouchesToBout = async () => {
+    if (!bout || !aiPredictedTouches.length || aiApplying) return
+    setAiApplying(true)
+    setPanelError('')
+
+    try {
+      const sorted = [...aiPredictedTouches].sort((a, b) => a.time - b.time)
+      for (const touch of sorted) {
+        await api(`/api/bouts/${bout.id}/touches`, {
+          method: 'POST',
+          body: JSON.stringify({
+            video_time_seconds: clamp(Number(touch.time) || 0, 0, videoRef.current?.duration || Number.MAX_SAFE_INTEGER),
+            scorer: touch.scorer,
+            row_verdict: touch.verdict || `AI DETECTED ${String(touch.scorer || 'none').toUpperCase()} TOUCH`,
+            note: touch.note || 'AI score tracking prediction',
+          }),
+        })
+      }
+
+      await loadBout()
+      setAiPredictedTouches([])
+      setActiveTab('touches')
+    } catch (err) {
+      setPanelError(err.message || 'Failed to apply AI touches')
+    } finally {
+      setAiApplying(false)
+    }
+  }
+
   useEffect(() => {
     const onKeyDown = (event) => {
       const tag = document.activeElement?.tagName
@@ -260,10 +604,10 @@ export default function AnalyzerPage() {
 
       if (event.key === '1') {
         event.preventDefault()
-        saveTouch({ scorer: 'left', verdict: `POINT LEFT (QUICK ADD)` })
+        saveTouch({ scorer: 'left', verdict: 'POINT LEFT (QUICK ADD)' })
       } else if (event.key === '2') {
         event.preventDefault()
-        saveTouch({ scorer: 'right', verdict: `POINT RIGHT (QUICK ADD)` })
+        saveTouch({ scorer: 'right', verdict: 'POINT RIGHT (QUICK ADD)' })
       } else if (event.key === '0') {
         event.preventDefault()
         saveTouch({ scorer: 'none', verdict: 'NO TOUCH (QUICK ADD)' })
@@ -340,6 +684,7 @@ export default function AnalyzerPage() {
               ['row', 'ROW Assistant'],
               ['trail', 'Tip Trail'],
               ['touches', 'Touches'],
+              ['ai', 'AI Score'],
               ['notes', 'Notes'],
             ].map(([key, label]) => (
               <button
@@ -351,6 +696,10 @@ export default function AnalyzerPage() {
               </button>
             ))}
           </div>
+
+          {panelError ? (
+            <p className="text-xs text-red-300 bg-red-500/10 border border-red-500/40 rounded p-2">{panelError}</p>
+          ) : null}
 
           {activeTab === 'row' && (
             <div className="space-y-3 text-sm">
@@ -656,18 +1005,272 @@ export default function AnalyzerPage() {
                   bout.touches
                     .slice()
                     .sort((a, b) => a.video_time_seconds - b.video_time_seconds)
-                    .map((t) => (
-                      <div key={t.id} className="border border-slate-700 rounded p-2">
-                        <div className="flex justify-between text-slate-300">
-                          <span>{formatClock(t.video_time_seconds)}</span>
-                          <span>{t.scorer.toUpperCase()}</span>
+                    .map((t) => {
+                      const isEditing = editingTouchId === t.id
+                      return (
+                        <div key={t.id} className="border border-slate-700 rounded p-2 space-y-2">
+                          {!isEditing ? (
+                            <>
+                              <div className="flex justify-between text-slate-300">
+                                <span>{formatClock(t.video_time_seconds)}</span>
+                                <span>{t.scorer.toUpperCase()}</span>
+                              </div>
+                              <p className="text-slate-400">{t.row_verdict || '—'} • {bout.weapon.toUpperCase()}</p>
+                              {t.note ? <p className="text-slate-500">{t.note}</p> : null}
+                              <div className="flex gap-2">
+                                <button className="btn-ghost" onClick={() => startEditTouch(t)} disabled={touchSaving}>
+                                  <Pencil size={14} /> Edit
+                                </button>
+                                <button className="btn-ghost" onClick={() => deleteTouch(t.id)} disabled={touchSaving}>
+                                  <Trash2 size={14} /> Delete
+                                </button>
+                              </div>
+                            </>
+                          ) : (
+                            <>
+                              <div className="grid grid-cols-2 gap-2">
+                                <label className="space-y-1">
+                                  <span>Time (s)</span>
+                                  <input
+                                    type="number"
+                                    min="0"
+                                    step="0.01"
+                                    value={editTouchDraft.video_time_seconds}
+                                    onChange={(e) => setEditTouchDraft((prev) => ({ ...prev, video_time_seconds: e.target.value }))}
+                                    className="w-full rounded bg-slate-900 border border-slate-700 px-2 py-1"
+                                  />
+                                </label>
+                                <label className="space-y-1">
+                                  <span>Scorer</span>
+                                  <select
+                                    value={editTouchDraft.scorer}
+                                    onChange={(e) => setEditTouchDraft((prev) => ({ ...prev, scorer: e.target.value }))}
+                                    className="w-full rounded bg-slate-900 border border-slate-700 px-2 py-1"
+                                  >
+                                    <option value="left">Left</option>
+                                    <option value="right">Right</option>
+                                    <option value="none">None</option>
+                                  </select>
+                                </label>
+                              </div>
+                              <label className="space-y-1 block">
+                                <span>Verdict</span>
+                                <input
+                                  value={editTouchDraft.row_verdict}
+                                  onChange={(e) => setEditTouchDraft((prev) => ({ ...prev, row_verdict: e.target.value }))}
+                                  className="w-full rounded bg-slate-900 border border-slate-700 px-2 py-1"
+                                />
+                              </label>
+                              <label className="space-y-1 block">
+                                <span>Note</span>
+                                <input
+                                  value={editTouchDraft.note}
+                                  onChange={(e) => setEditTouchDraft((prev) => ({ ...prev, note: e.target.value }))}
+                                  className="w-full rounded bg-slate-900 border border-slate-700 px-2 py-1"
+                                />
+                              </label>
+                              <div className="flex gap-2">
+                                <button className="btn-ghost" onClick={() => saveEditedTouch(t.id)} disabled={touchSaving}>
+                                  <Check size={14} /> Save
+                                </button>
+                                <button className="btn-ghost" onClick={() => setEditingTouchId(null)} disabled={touchSaving}>
+                                  <X size={14} /> Cancel
+                                </button>
+                              </div>
+                            </>
+                          )}
                         </div>
-                        <p className="text-slate-400">{t.row_verdict || '—'} • {bout.weapon.toUpperCase()}</p>
-                        {t.note ? <p className="text-slate-500">{t.note}</p> : null}
-                      </div>
-                    ))
+                      )
+                    })
                 )}
               </div>
+            </div>
+          )}
+
+          {activeTab === 'ai' && (
+            <div className="space-y-3 text-sm">
+              <h3 className="font-semibold">AI Score Tracking (Best Effort)</h3>
+              <p className="text-slate-400">
+                The model scans likely red/green light regions over time, predicts touches, then lets you edit before applying.
+              </p>
+
+              <div className="grid grid-cols-2 gap-2 text-xs">
+                <label className="space-y-1">
+                  <span>Sample interval (s)</span>
+                  <input
+                    type="number"
+                    min="0.04"
+                    max="0.5"
+                    step="0.01"
+                    value={aiConfig.sampleInterval}
+                    onChange={(e) => setAiConfig((prev) => ({ ...prev, sampleInterval: Number(e.target.value) }))}
+                    className="w-full rounded bg-slate-900 border border-slate-700 px-2 py-1"
+                  />
+                </label>
+                <label className="space-y-1">
+                  <span>Cooldown (s)</span>
+                  <input
+                    type="number"
+                    min="0.2"
+                    max="2"
+                    step="0.1"
+                    value={aiConfig.cooldown}
+                    onChange={(e) => setAiConfig((prev) => ({ ...prev, cooldown: Number(e.target.value) }))}
+                    className="w-full rounded bg-slate-900 border border-slate-700 px-2 py-1"
+                  />
+                </label>
+                <label className="space-y-1 col-span-2">
+                  <span>Sensitivity (higher = fewer detections)</span>
+                  <input
+                    type="range"
+                    min="1.2"
+                    max="4"
+                    step="0.1"
+                    value={aiConfig.sensitivity}
+                    onChange={(e) => setAiConfig((prev) => ({ ...prev, sensitivity: Number(e.target.value) }))}
+                    className="w-full"
+                  />
+                  <p className="text-slate-400">{aiConfig.sensitivity.toFixed(1)}</p>
+                </label>
+              </div>
+
+              <div className="border border-slate-700 rounded p-2 space-y-2 text-xs">
+                <p className="font-medium">Left light region (x, y, w, h)</p>
+                <div className="grid grid-cols-4 gap-1">
+                  {['x', 'y', 'w', 'h'].map((field) => (
+                    <input
+                      key={`left-${field}`}
+                      type="number"
+                      min="0"
+                      max="1"
+                      step="0.01"
+                      value={aiRegions.left[field]}
+                      onChange={(e) =>
+                        setAiRegions((prev) => ({
+                          ...prev,
+                          left: { ...prev.left, [field]: clamp(Number(e.target.value), 0, 1) },
+                        }))
+                      }
+                      className="rounded bg-slate-900 border border-slate-700 px-1 py-1"
+                    />
+                  ))}
+                </div>
+              </div>
+
+              <div className="border border-slate-700 rounded p-2 space-y-2 text-xs">
+                <p className="font-medium">Right light region (x, y, w, h)</p>
+                <div className="grid grid-cols-4 gap-1">
+                  {['x', 'y', 'w', 'h'].map((field) => (
+                    <input
+                      key={`right-${field}`}
+                      type="number"
+                      min="0"
+                      max="1"
+                      step="0.01"
+                      value={aiRegions.right[field]}
+                      onChange={(e) =>
+                        setAiRegions((prev) => ({
+                          ...prev,
+                          right: { ...prev.right, [field]: clamp(Number(e.target.value), 0, 1) },
+                        }))
+                      }
+                      className="rounded bg-slate-900 border border-slate-700 px-1 py-1"
+                    />
+                  ))}
+                </div>
+              </div>
+
+              <button className="btn-primary w-full" onClick={runAiScoreTracking} disabled={aiScanning || aiApplying}>
+                {aiScanning ? (
+                  <span className="inline-flex items-center gap-2">
+                    <Loader2 size={16} className="animate-spin" /> Scanning video... {aiProgress}%
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-2">
+                    <Sparkles size={16} /> Run AI Score Tracking
+                  </span>
+                )}
+              </button>
+
+              {aiPredictedTouches.length > 0 ? (
+                <>
+                  <div className="flex items-center justify-between text-xs">
+                    <p className="text-slate-300">Predicted touches: {aiPredictedTouches.length}</p>
+                    <button className="btn-ghost" onClick={() => setAiPredictedTouches([])} disabled={aiApplying}>
+                      Clear
+                    </button>
+                  </div>
+                  <div className="max-h-64 overflow-auto space-y-2">
+                    {aiPredictedTouches
+                      .slice()
+                      .sort((a, b) => a.time - b.time)
+                      .map((touch) => (
+                        <div key={touch.id} className="border border-slate-700 rounded p-2 space-y-2 text-xs">
+                          <div className="grid grid-cols-2 gap-2">
+                            <label className="space-y-1">
+                              <span>Time (s)</span>
+                              <input
+                                type="number"
+                                min="0"
+                                step="0.01"
+                                value={touch.time}
+                                onChange={(e) => {
+                                  const value = Number(e.target.value)
+                                  setAiPredictedTouches((prev) =>
+                                    prev.map((item) => (item.id === touch.id ? { ...item, time: value } : item))
+                                  )
+                                }}
+                                className="w-full rounded bg-slate-900 border border-slate-700 px-2 py-1"
+                              />
+                            </label>
+                            <label className="space-y-1">
+                              <span>Scorer</span>
+                              <select
+                                value={touch.scorer}
+                                onChange={(e) => {
+                                  const scorer = e.target.value
+                                  setAiPredictedTouches((prev) =>
+                                    prev.map((item) =>
+                                      item.id === touch.id
+                                        ? {
+                                            ...item,
+                                            scorer,
+                                            verdict: `AI DETECTED ${scorer.toUpperCase()} TOUCH`,
+                                          }
+                                        : item
+                                    )
+                                  )
+                                }}
+                                className="w-full rounded bg-slate-900 border border-slate-700 px-2 py-1"
+                              >
+                                <option value="left">Left</option>
+                                <option value="right">Right</option>
+                                <option value="none">None / simultaneous</option>
+                              </select>
+                            </label>
+                          </div>
+                          <div className="flex items-center justify-between">
+                            <span className="text-slate-400">{formatClock(Number(touch.time) || 0)} • {(touch.confidence * 100).toFixed(0)}%</span>
+                            <button
+                              className="btn-ghost"
+                              onClick={() =>
+                                setAiPredictedTouches((prev) => prev.filter((item) => item.id !== touch.id))
+                              }
+                              disabled={aiApplying}
+                            >
+                              <Trash2 size={14} /> Remove
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                  </div>
+                  <button className="btn-primary w-full" onClick={applyAiTouchesToBout} disabled={aiApplying}>
+                    {aiApplying ? 'Applying predicted touches...' : 'Apply Predicted Touches to Bout'}
+                  </button>
+                </>
+              ) : (
+                <p className="text-xs text-slate-400">No AI predictions yet. Tune regions/sensitivity and run scan.</p>
+              )}
             </div>
           )}
 

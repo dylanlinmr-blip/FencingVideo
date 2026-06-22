@@ -1166,6 +1166,49 @@ app.post('/api/bouts/:id/touches', async (c) => {
   return c.json({ touch, score }, 201)
 })
 
+app.patch('/api/touches/:id', async (c) => {
+  await ensureSchema(c.env)
+  const { ownerKey } = await getAuthContext(c)
+  const touchId = Number(c.req.param('id'))
+  const payload = await c.req.json()
+
+  const existing = await c.env.DB.prepare(
+    `SELECT t.*
+     FROM touches t
+     JOIN bouts b ON b.id = t.bout_id
+     WHERE t.id = ? AND b.owner_key = ?`
+  )
+    .bind(touchId, ownerKey)
+    .first()
+
+  if (!existing) return c.json({ error: 'Touch not found' }, 404)
+
+  const nextScorer = payload?.scorer ?? existing.scorer
+  const nextTime = payload?.video_time_seconds ?? existing.video_time_seconds
+  const nextVerdict = payload?.row_verdict ?? existing.row_verdict
+  const nextNote = payload?.note ?? existing.note
+
+  if (!['left', 'right', 'none'].includes(String(nextScorer))) {
+    return c.json({ error: 'scorer must be left, right, or none' }, 400)
+  }
+
+  const parsedTime = Number(nextTime)
+  if (!Number.isFinite(parsedTime) || parsedTime < 0) {
+    return c.json({ error: 'video_time_seconds must be a non-negative number' }, 400)
+  }
+
+  await c.env.DB.prepare(
+    'UPDATE touches SET video_time_seconds = ?, scorer = ?, row_verdict = ?, note = ? WHERE id = ?'
+  )
+    .bind(parsedTime, String(nextScorer), nextVerdict ?? null, nextNote ?? null, touchId)
+    .run()
+
+  const touch = await c.env.DB.prepare('SELECT * FROM touches WHERE id = ?').bind(touchId).first()
+  const score = await recalculateBoutScore(c.env, existing.bout_id)
+
+  return c.json({ touch, score })
+})
+
 app.delete('/api/touches/:id', async (c) => {
   await ensureSchema(c.env)
   const { ownerKey, user } = await getAuthContext(c)
