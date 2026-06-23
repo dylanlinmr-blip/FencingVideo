@@ -225,6 +225,114 @@ async function detectAiScoreTimeline({ videoUrl, leftRegion, rightRegion, sample
   return mergeSimultaneousEvents([...leftEvents, ...rightEvents])
 }
 
+function estimateAiRowFromTrail({ bout, time, windowSeconds = 2.2 }) {
+  if (!bout || bout.weapon === 'epee') {
+    return { error: 'AI ROW tracking is currently optimized for foil/sabre.' }
+  }
+
+  const start = Math.max(0, time - windowSeconds)
+  const inWindow = (fencer) =>
+    (bout.tip_marks || [])
+      .filter((mark) => mark.fencer === fencer && mark.video_time_seconds >= start && mark.video_time_seconds <= time)
+      .sort((a, b) => a.video_time_seconds - b.video_time_seconds)
+
+  const leftMarks = inWindow('left')
+  const rightMarks = inWindow('right')
+
+  if (leftMarks.length < 2 && rightMarks.length < 2) {
+    return { error: 'Not enough tip-mark data. Mark a short exchange first, then run AI ROW suggestion.' }
+  }
+
+  const summarize = (marks, side) => {
+    let forward = 0
+    let activity = 0
+    for (let i = 1; i < marks.length; i += 1) {
+      const dx = Number(marks[i].x_norm) - Number(marks[i - 1].x_norm)
+      const signed = side === 'left' ? dx : -dx
+      forward += signed
+      activity += Math.abs(dx)
+    }
+
+    return {
+      marks: marks.length,
+      start: marks[0]?.video_time_seconds ?? Number.POSITIVE_INFINITY,
+      end: marks[marks.length - 1]?.video_time_seconds ?? Number.NEGATIVE_INFINITY,
+      forward,
+      activity,
+    }
+  }
+
+  const left = summarize(leftMarks, 'left')
+  const right = summarize(rightMarks, 'right')
+  const forwardGap = left.forward - right.forward
+  const activityTotal = left.activity + right.activity
+
+  let initiator = 'both'
+  if (Math.abs(forwardGap) >= 0.03) {
+    initiator = forwardGap > 0 ? 'left' : 'right'
+  } else if (Math.abs(left.start - right.start) > 0.25) {
+    initiator = left.start < right.start ? 'left' : 'right'
+  }
+
+  const attackEstablished = activityTotal > 0.05 || Math.abs(forwardGap) > 0.02
+  const answers = {
+    step1AttackEstablished: attackEstablished ? 'yes' : 'no',
+    step1Initiator: initiator,
+  }
+
+  const reasons = []
+  if (!attackEstablished) {
+    answers.step1BothLights = Math.abs(forwardGap) < 0.05 ? 'yes' : 'no'
+    answers.step1SingleLightScorer = forwardGap >= 0 ? 'left' : 'right'
+    reasons.push('Limited forward pressure detected from both fencers in this exchange window.')
+  } else if (initiator !== 'both') {
+    const attacker = initiator === 'left' ? left : right
+    const defender = initiator === 'left' ? right : left
+    const landedNoParry = attacker.forward - defender.forward > 0.03 && defender.activity < attacker.activity * 0.9
+    answers.step2LandedNoParry = landedNoParry ? 'yes' : 'no'
+
+    if (!landedNoParry) {
+      const successfulParry = defender.activity >= attacker.activity * 0.7 || defender.forward >= attacker.forward * 0.8
+      answers.step3SuccessfulParry = successfulParry ? 'yes' : 'no'
+
+      if (successfulParry) {
+        const riposteImmediate = defender.start - attacker.start < 0.9
+        answers.step4RiposteImmediate = riposteImmediate ? 'yes' : 'no'
+        if (!riposteImmediate) {
+          answers.step4OriginalAttackerRemise = attacker.activity >= defender.activity ? 'yes' : 'no'
+        }
+      } else {
+        answers.step3DefenderThenAttack = defender.forward > 0.02 ? 'yes' : 'no'
+      }
+    }
+
+    reasons.push(
+      `${initiator.toUpperCase()} showed stronger initiating motion (forward delta ${Math.abs(forwardGap).toFixed(3)}).`
+    )
+  } else {
+    reasons.push('Both fencers initiated at near-similar timing and pressure; likely simultaneous setup.')
+  }
+
+  const row = evaluateRow(bout.weapon, answers)
+  const confidence = clamp(
+    0.25 + Math.min(0.45, activityTotal * 2.5) + Math.min(0.25, Math.abs(forwardGap) * 3),
+    0.2,
+    0.95
+  )
+
+  return {
+    answers,
+    row,
+    confidence,
+    reasons,
+    metrics: {
+      left_marks: left.marks,
+      right_marks: right.marks,
+      forward_gap: Number(forwardGap.toFixed(3)),
+    },
+  }
+}
+
 export default function AnalyzerPage() {
   const { id } = useParams()
   const videoRef = useRef(null)
@@ -267,6 +375,9 @@ export default function AnalyzerPage() {
     sensitivity: 2.2,
     cooldown: 0.8,
   })
+  const [aiRowRunning, setAiRowRunning] = useState(false)
+  const [autoRowTracking, setAutoRowTracking] = useState(false)
+  const [aiRowSuggestion, setAiRowSuggestion] = useState(null)
   const [answers, setAnswers] = useState({
     step1AttackEstablished: 'yes',
     step1Initiator: 'left',
@@ -420,6 +531,37 @@ export default function AnalyzerPage() {
       right: bout.touches.filter((t) => t.scorer === 'right').length,
     }
   }, [bout])
+
+  const runAiRowSuggestion = () => {
+    if (!bout || bout.weapon === 'epee') {
+      setPanelError('AI ROW tracking currently supports foil/sabre. For epee, use scorer and double-touch controls.')
+      return
+    }
+
+    setAiRowRunning(true)
+    setPanelError('')
+    try {
+      const suggestion = estimateAiRowFromTrail({
+        bout,
+        time: Number(videoRef.current?.currentTime ?? currentTime),
+      })
+
+      if (suggestion.error) {
+        setPanelError(suggestion.error)
+        return
+      }
+
+      setAiRowSuggestion(suggestion)
+      setAnswers((prev) => ({ ...prev, ...suggestion.answers }))
+    } finally {
+      setAiRowRunning(false)
+    }
+  }
+
+  const applyAiRowSuggestion = () => {
+    if (!aiRowSuggestion?.answers) return
+    setAnswers((prev) => ({ ...prev, ...aiRowSuggestion.answers }))
+  }
 
   const saveTouch = async (override = null) => {
     if (!bout || !videoRef.current || touchSaving) return
@@ -598,6 +740,20 @@ export default function AnalyzerPage() {
   }
 
   useEffect(() => {
+    if (!autoRowTracking || !bout || bout.weapon === 'epee') return
+
+    const suggestion = estimateAiRowFromTrail({
+      bout,
+      time: Number(currentTime),
+    })
+
+    if (!suggestion.error) {
+      setAiRowSuggestion(suggestion)
+      setAnswers((prev) => ({ ...prev, ...suggestion.answers }))
+    }
+  }, [autoRowTracking, bout, currentTime])
+
+  useEffect(() => {
     const onKeyDown = (event) => {
       const tag = document.activeElement?.tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || event.repeat) return
@@ -704,6 +860,44 @@ export default function AnalyzerPage() {
           {activeTab === 'row' && (
             <div className="space-y-3 text-sm">
               <h3 className="font-semibold">ROW Assistant ({bout.weapon.toUpperCase()})</h3>
+
+              <div className="grid grid-cols-1 gap-2">
+                <button className="btn-primary" onClick={runAiRowSuggestion} disabled={aiRowRunning || touchSaving}>
+                  {aiRowRunning ? (
+                    <span className="inline-flex items-center gap-2"><Loader2 size={14} className="animate-spin" /> Tracking ROW...</span>
+                  ) : (
+                    <span className="inline-flex items-center gap-2"><Sparkles size={14} /> AI Suggest ROW at Playhead</span>
+                  )}
+                </button>
+
+                <label className="flex items-center gap-2 text-xs text-slate-300">
+                  <input
+                    type="checkbox"
+                    checked={autoRowTracking}
+                    onChange={(e) => setAutoRowTracking(e.target.checked)}
+                    disabled={bout.weapon === 'epee'}
+                  />
+                  Auto-track ROW while scrubbing (foil/sabre)
+                </label>
+
+                {aiRowSuggestion?.row ? (
+                  <div className="bg-slate-900/50 border border-slate-700 rounded p-2 text-xs space-y-1">
+                    <p className="text-slate-200">AI verdict: <span className="font-semibold">{aiRowSuggestion.row.verdict}</span></p>
+                    <p className="text-slate-400">Confidence: {Math.round((aiRowSuggestion.confidence || 0) * 100)}% • Marks L/R: {aiRowSuggestion.metrics?.left_marks || 0}/{aiRowSuggestion.metrics?.right_marks || 0}</p>
+                    {aiRowSuggestion.reasons?.length ? (
+                      <ul className="list-disc pl-4 text-slate-400 space-y-1">
+                        {aiRowSuggestion.reasons.map((reason) => (
+                          <li key={reason}>{reason}</li>
+                        ))}
+                      </ul>
+                    ) : null}
+                    <div>
+                      <button type="button" className="btn-ghost text-xs" onClick={applyAiRowSuggestion}>Use AI Answers</button>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+
               {bout.weapon === 'epee' ? (
                 <>
                   <p className="text-slate-400">Épée has no right-of-way. Record scorer (or double-touch).</p>
