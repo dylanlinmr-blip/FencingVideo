@@ -1,0 +1,98 @@
+class FenceVisionAutoScore {
+    constructor() {
+        this.score = {
+            left: 0,
+            right: 0
+        };
+
+        this.previousScoreboard = {
+            left: 0,
+            right: 0
+        };
+
+        this.touchHistory = [];
+    }
+
+    processFrame(frame) {
+
+        /*
+        Expected frame format:
+
+        {
+            scoreboard: {
+                left: 2,
+                right: 1
+            },
+
+            leftAttack: true,
+            rightAttack: false,
+
+            leftLight: false,
+            rightLight: true,
+
+            timestamp: 15.28
+        }
+        */
+
+        if (!frame.scoreboard)
+            return;
+
+        this.detectScoreChange(frame);
+    }
+
+    detectScoreChange(frame) {
+
+        const current = frame.scoreboard;
+        const previous = this.previousScoreboard;
+
+        if (current.left > previous.left) {
+
+            this.score.left++;
+
+            this.touchHistory.push({
+                side: "LEFT",
+                time: frame.timestamp
+            });
+
+            console.log("LEFT SCORES");
+        }
+
+        if (current.right > previous.right) {
+
+            this.score.right++;
+
+            this.touchHistory.push({
+                side: "RIGHT",
+                time: frame.timestamp
+            });
+
+            console.log("RIGHT SCORES");
+        }
+
+        this.previousScoreboard = {
+            left: current.left,
+            right: current.right
+        };
+    }
+
+    getScore() {
+        return this.score;
+    }
+
+    getHistory() {
+        return this.touchHistory;
+    }
+
+    reset() {
+
+        this.score.left = 0;
+        this.score.right = 0;
+
+        this.previousScoreboard.left = 0;
+        this.previousScoreboard.right = 0;
+
+        this.touchHistory = [];
+    }
+}
+
+export default FenceVisionAutoScore;
